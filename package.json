@@ -1,0 +1,37 @@
+{
+  "name": "pi-qoder-agent-sdk-bridge",
+  "version": "0.1.0",
+  "description": "Pi extension that bridges the Qoder Agent SDK (official @qoder-ai/qoder-agent-sdk) into Pi as a model provider",
+  "license": "MIT",
+  "type": "module",
+  "keywords": ["pi-package", "pi", "qoder", "agent-sdk", "model-provider"],
+  "files": ["extensions/index.ts", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "docs/"],
+  "publishConfig": { "access": "public" },
+  "repository": { "type": "git", "url": "git+https://github.com/ludi-uni/pi-qoder-agent-sdk-bridge.git" },
+  "homepage": "https://github.com/ludi-uni/pi-qoder-agent-sdk-bridge#readme",
+  "bugs": { "url": "https://github.com/ludi-uni/pi-qoder-agent-sdk-bridge/issues" },
+  "scripts": {
+    "test": "node --import tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@qoder-ai/qoder-agent-sdk": "1.0.32"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ]
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}

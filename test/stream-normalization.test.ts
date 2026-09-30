@@ -171,11 +171,44 @@ test("B: malformed envelope JSON → protocol_error", () => {
   assert.equal(out.error.code, "MALFORMED_ENVELOPE_JSON");
 });
 
-test("B: marker with prose around envelope → protocol_error (strict)", () => {
-  const out = normalizeProviderResponse(`let me check <pi_tool_call>{"name":"read","arguments":{"path":"a"}}</pi_tool_call>`, TOOLS);
-  assert.equal(out.kind, "protocol_error");
-  if (out.kind !== "protocol_error") return;
-  assert.equal(out.error.code, "PROSE_AROUND_ENVELOPE");
+test("B: commentary before, between and after envelopes is ignored", () => {
+  const out = normalizeProviderResponse(
+    `I'll read the package.json file to extract the name value as requested.\n\n<pi_tool_call>{"name":"read","arguments":{"path":"D:/Develop/pi-qoder-bridge/package.json"}} </pi_tool_call>\nThen list files.\n<pi_tool_call>{"name":"ls","arguments":{}}</pi_tool_call> Done.`,
+    TOOLS,
+  );
+  assert.equal(out.kind, "tool_calls");
+  if (out.kind !== "tool_calls") return;
+  assert.deepEqual(out.calls.map(c => c.name), ["read", "ls"]);
+  assert.deepEqual(out.calls[0].arguments, { path: "D:/Develop/pi-qoder-bridge/package.json" });
+});
+
+test("B: extra brace inside an envelope remains invalid; outside is ignored", () => {
+  const inside = normalizeProviderResponse(`Checking <pi_tool_call>{"name":"read","arguments":{"path":"a"}}}</pi_tool_call>`, TOOLS);
+  assert.equal(inside.kind, "protocol_error");
+  if (inside.kind !== "protocol_error") return;
+  assert.equal(inside.error.code, "MALFORMED_ENVELOPE_JSON");
+  assert.equal(normalizeProviderResponse(`<pi_tool_call>{"name":"read","arguments":{"path":"a"}}</pi_tool_call>}`, TOOLS).kind, "tool_calls");
+});
+
+test("B: commentary does not bypass tool or argument validation", () => {
+  for (const [payload, code] of [
+    ['{"name":"rm_rf","arguments":{}}', "UNKNOWN_TOOL"],
+    ['{"name":"read","arguments":{"path":42}}', "INVALID_ARGUMENTS"],
+  ]) {
+    const out = normalizeProviderResponse(`Checking <pi_tool_call>${payload}</pi_tool_call> Done.`, TOOLS);
+    assert.equal(out.kind, "protocol_error");
+    if (out.kind !== "protocol_error") continue;
+    assert.equal(out.error.code, code);
+  }
+});
+
+test("B: a complete envelope cannot hide an extra malformed marker", () => {
+  for (const extra of ['<pi_tool_call>{', '</pi_tool_call>', '<PI_TOOL_CALL>{}</PI_TOOL_CALL>']) {
+    const out = normalizeProviderResponse(`<pi_tool_call>{"name":"read","arguments":{"path":"a"}}</pi_tool_call>${extra}`, TOOLS);
+    assert.equal(out.kind, "protocol_error");
+    if (out.kind !== "protocol_error") continue;
+    assert.equal(out.error.code, "UNCLOSED_ENVELOPE");
+  }
 });
 
 test("B: unclosed pi_tool_call marker → protocol_error", () => {

@@ -450,9 +450,10 @@ function parseToolCallEnvelope(raw: string, index: number): ParsedToolCall {
 /**
  * Strict bridge contract normalizer.
  * - Any pi_tool_call marker (even an unclosed one) forces tool-call semantics:
- *   surrounding prose, a missing close tag, malformed JSON, unknown fields,
+ *   a missing close tag, malformed JSON, unknown fields,
  *   empty/duplicate ids, unlisted tool names, or schema-invalid arguments are
  *   all ProviderProtocolError — never silently degraded to text.
+ *   Text outside complete envelopes is ignored, not emitted or executed.
  * - Exactly one standard text shape is accepted: a single wrapperless
  *   {id, type:"function", function:{name, arguments:JSONstring}} envelope.
  * - Structured input (SDK-native tool_use content blocks) is parsed by the
@@ -551,8 +552,9 @@ function normalizeQoderEnvelopeText(
     return fail(new ProviderProtocolError("UNCLOSED_ENVELOPE", "pi_tool_call marker found without a complete envelope"));
   }
   const outside = text.replace(TOOL_CALL_RE, "").trim();
-  if (outside) {
-    return fail(new ProviderProtocolError("PROSE_AROUND_ENVELOPE", "pi_tool_call envelopes must be the entire output; surrounding prose is not allowed"));
+  // Ignore commentary, but never hide an incomplete or malformed extra marker.
+  if (/<\/?pi_tool_call\b/i.test(outside)) {
+    return fail(new ProviderProtocolError("UNCLOSED_ENVELOPE", "pi_tool_call marker found outside a complete envelope"));
   }
   try {
     return matches.map((match, index) => {
@@ -660,15 +662,8 @@ export function normalizeProviderResponse(input: string | StructuredProviderPayl
 
 /** Lenient legacy helper kept for callers that predate the strict normalizer. */
 export function parseToolCalls(text: string): ParsedToolCall[] | null {
-  const matches = [...text.matchAll(TOOL_CALL_RE)];
-  if (matches.length === 0) return null;
-  const outside = text.replace(TOOL_CALL_RE, "").trim();
-  if (outside) return null;
-  try {
-    return matches.map((match, index) => parseToolCallEnvelope(match[1], index + 1));
-  } catch {
-    return null;
-  }
+  const parsed = normalizeQoderEnvelopeText(text, undefined);
+  return Array.isArray(parsed) ? parsed : null;
 }
 
 /**

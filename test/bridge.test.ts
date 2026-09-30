@@ -171,9 +171,9 @@ test("parseToolCalls extracts multiple envelopes", () => {
   assert.equal(calls[1].name, "b");
 });
 
-test("parseToolCalls returns null when text surrounds envelopes", () => {
-  const text = `some prose <pi_tool_call>{"name":"a","arguments":{}}</pi_tool_call>`;
-  assert.equal(parseToolCalls(text), null);
+test("parseToolCalls ignores text surrounding envelopes", () => {
+  const text = `some prose <pi_tool_call>{"name":"a","arguments":{}}</pi_tool_call> done`;
+  assert.deepEqual(parseToolCalls(text), [{ name: "a", arguments: {}, id: undefined }]);
 });
 
 test("parseToolCalls returns null for malformed JSON", () => {

@@ -2,7 +2,7 @@
 
 Use Qoder models in [Pi](https://pi.dev/) through the **official Qoder Agent SDK**. Independent community extension; not affiliated with Qoder or Pi.
 
-> **Release status:** 0.1.0 candidate. The npm package has **not** been published yet. `pi-qoder-bridge` is owned by another project, so this package uses the distinct name `pi-qoder-agent-sdk-bridge` (availability and ownership must be checked again before publishing).
+> **Release status:** 0.2.1 prepared for npm publication; this version has not been published by this release preparation. `pi-qoder-bridge` is owned by another project, so this package uses the distinct name `pi-qoder-agent-sdk-bridge`.
 
 [日本語の導入ガイド](docs/ja/quickstart.md) · [Qoder SDK](https://docs.qoder.com/cli/sdk/overview) · [Third-party terms](THIRD_PARTY_NOTICES.md)
 
@@ -11,7 +11,7 @@ Use Qoder models in [Pi](https://pi.dev/) through the **official Qoder Agent SDK
 Requirements: Node.js 20+, Pi, and a Qoder account with either a Personal Access Token (PAT) or a signed-in Qoder CLI. Your package manager must allow the Qoder SDK postinstall script to fetch its Worker runtime.
 
 ```sh
-pi install npm:pi-qoder-agent-sdk-bridge@0.1.0
+pi install npm:pi-qoder-agent-sdk-bridge@0.2.1
 pi list
 ```
 
@@ -49,7 +49,7 @@ To load this checkout across Pi sessions, run `pi install <absolute-path-to-this
 
 Payload shape selects exactly one strict parser; a parse failure never tries another parser or completes as text. Supported shapes:
 
-- Qoder: `<pi_tool_call>{"id":"call_1","name":"read","arguments":{"path":"package.json"}}</pi_tool_call>`. Qoder IDs remain optional (generated when omitted).
+- Qoder: `<pi_tool_call>{"id":"call_1","name":"read","arguments":{"path":"package.json"}}</pi_tool_call>`. Qoder IDs remain optional (generated when omitted). Text outside complete envelopes (including commentary or stray `}`) is ignored, not emitted or executed. Extra incomplete/malformed markers and invalid JSON inside envelopes still fail; no JSON repair is performed.
 - SDK-native assistant content block: `{"type":"tool_use","id":"call_1","name":"read","input":{"path":"package.json"}}`.
 - Wrapperless function envelope as the entire assistant text: `{"id":"call_1","type":"function","function":{"name":"read","arguments":"{\"path\":\"package.json\"}"}}`.
 

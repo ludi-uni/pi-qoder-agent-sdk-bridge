@@ -1,4 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -14,14 +16,17 @@ import {
   createProvider,
   getCurrentSystemPrompt,
   getCurrentTools,
+  validateToolCall,
   type Api,
   type ProviderAuthInteraction,
   type AssistantMessage,
   type AssistantMessageEventStream,
   type JsonObject,
+  type Message,
   type Model,
   type SimpleStreamOptions,
   type Tool,
+  type ToolCall,
   type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -249,15 +254,14 @@ function clean(value: unknown): string {
 }
 
 function compactSchema(tool: Tool): Record<string, unknown> {
-  const schema = tool.parameters as Record<string, unknown>;
+  // Preserve the full TypeBox JSON schema so the model sees every constraint
+  // (additionalProperties, nested types, enums, formats). Previously only
+  // type/properties/required survived, dropping nested schema information.
+  const parameters = (tool.parameters ?? { type: "object", properties: {} }) as Record<string, unknown>;
   return {
     name: tool.name,
     description: tool.description,
-    parameters: {
-      type: schema.type ?? "object",
-      properties: schema.properties ?? {},
-      required: schema.required ?? [],
-    },
+    parameters: { type: "object", properties: {}, ...parameters },
   };
 }
 
@@ -302,23 +306,404 @@ export interface ParsedToolCall {
   id?: string;
 }
 
-export function parseToolCalls(text: string): ParsedToolCall[] | null {
-  const matches = [...text.matchAll(/<pi_tool_call>\s*([\s\S]*?)\s*<\/pi_tool_call>/g)];
-  if (matches.length === 0) return null;
-  const outside = text.replace(/<pi_tool_call>[\s\S]*?<\/pi_tool_call>/g, "").trim();
-  if (outside) return null;
+export class ProviderProtocolError extends Error {
+  readonly code: string;
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = "ProviderProtocolError";
+    this.code = code;
+  }
+}
 
+/** Common normal form every accepted parser produces. Downstream emission
+ *  consumes this type only — it never branches on which parser produced it. */
+export interface NormalizedToolCall {
+  id: string;
+  name: string;
+  arguments: Record<string, unknown>;
+}
+
+export type TextResponse = { kind: "text"; text: string };
+export type ToolCallResponse = { kind: "tool_calls"; calls: NormalizedToolCall[]; parser: ParserKey };
+export type ProtocolErrorResponse = { kind: "protocol_error"; error: ProviderProtocolError };
+export type ProviderResponse = TextResponse | ToolCallResponse | ProtocolErrorResponse;
+
+const TOOL_CALL_RE = /<pi_tool_call>\s*([\s\S]*?)\s*<\/pi_tool_call>/g;
+const ENVELOPE_KEYS = new Set(["name", "arguments", "id"]);
+
+// --- Up-front input-shape classifier ---
+// Every provider payload (assembled text or structured native blocks) is
+// classified once into exactly one shape before any parser runs. The Qoder
+// marker check has priority over JSON detection so a malformed envelope can
+// never leak into the generic/standard path.
+export type ProviderPayloadShape = "QODER_TOOL" | "STANDARD_TOOL" | "MALFORMED_TOOL_LIKE" | "PLAIN_TEXT";
+export type ParserKey = "qoder_envelope" | "standard_function_envelope" | "native_tool_use";
+
+/** Structured (non-text) provider payload: SDK-native tool_use content blocks. */
+export type StructuredProviderPayload = {
+  kind: "blocks";
+  blocks: readonly unknown[];
+};
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+// Keys whose presence is a strong tool-intent signal on a parsed object.
+const STRONG_TOOL_KEYS = new Set(["tool_calls", "tool_call", "tool_invocation", "function_call", "call_id", "tool_use_id"]);
+const TOOL_ARG_KEYS = ["arguments"];
+const TOOL_NAMEISH_KEYS = ["name", "tool", "function"];
+const TOOL_TYPE_VALUES = new Set(["tool_call", "tool_calls", "tool_invocation", "function_call", "tool_use", "function"]);
+
+/** Structural tool-intent check for an already-parsed object (bounded, no string re-scan). */
+function objectIsToolLike(value: Record<string, unknown>): boolean {
+  const keys = new Set(Object.keys(value));
+  if (typeof value.type === "string" && TOOL_TYPE_VALUES.has(value.type)) return true;
+  for (const key of STRONG_TOOL_KEYS) if (keys.has(key)) return true;
+  return TOOL_ARG_KEYS.some((key) => keys.has(key)) && TOOL_NAMEISH_KEYS.some((key) => keys.has(key));
+}
+
+function jsonContainsToolLike(value: unknown, depth = 0): boolean {
+  if (depth > 8) return false;
+  if (Array.isArray(value)) return value.some((entry) => jsonContainsToolLike(entry, depth + 1));
+  if (isPlainObject(value)) return objectIsToolLike(value) || Object.values(value).some((entry) => jsonContainsToolLike(entry, depth + 1));
+  return false;
+}
+
+// Bounded text-level signal for payloads that are NOT valid JSON: an actual
+// tool-intent key pattern must appear inside a JSON-looking shell, so ordinary
+// prose and prose-with-JSON-fragments are never classified as tool-like.
+const TOOL_LIKE_TEXT_RE = /"(tool_calls|tool_call|tool_invocation|function_call|call_id|tool_use_id)"\s*:|"type"\s*:\s*"(tool_call|tool_calls|tool_invocation|function_call|tool_use|function)"|"function"\s*:\s*\{|(?=[\s\S]*"(name|tool)"\s*:)(?=[\s\S]*"arguments"\s*:)/;
+
+function isMalformedToolLikeText(trimmed: string): boolean {
+  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return false;
+  return TOOL_LIKE_TEXT_RE.test(trimmed);
+}
+
+/**
+ * Classify a parsed JSON value once. Exactly one accepted standard shape
+ * exists — a single wrapperless {id, type:"function", function:{name,
+ * arguments:string}} envelope — everything else that signals tool intent is
+ * malformed tool-like, and anything else is ordinary JSON → plain text.
+ */
+function classifyParsedJson(value: unknown): ProviderPayloadShape {
+  if (!isPlainObject(value) && !Array.isArray(value)) return "PLAIN_TEXT";
+  if (isPlainObject(value) && value.type === "function" && isPlainObject(value.function)) return "STANDARD_TOOL";
+  return jsonContainsToolLike(value) ? "MALFORMED_TOOL_LIKE" : "PLAIN_TEXT";
+}
+
+/** Internal classify that also returns the already-parsed JSON value. */
+function classifyString(input: string): { shape: ProviderPayloadShape; parsed?: unknown } {
+  // Qoder marker recognition has priority over malformed-JSON detection.
+  if (/<\/?pi_tool_call\b/i.test(input)) return { shape: "QODER_TOOL" };
+  const trimmed = input.trim();
+  if (!trimmed) return { shape: "PLAIN_TEXT" };
   try {
-    return matches.map((match) => {
-      const parsed = JSON.parse(match[1]) as ParsedToolCall;
-      if (!parsed || typeof parsed.name !== "string" || !parsed.name || !parsed.arguments || typeof parsed.arguments !== "object" || Array.isArray(parsed.arguments) || parsed.id !== undefined && typeof parsed.id !== "string") {
-        throw new Error("Invalid tool call envelope");
-      }
-      return parsed;
+    const parsed = JSON.parse(trimmed);
+    return { shape: classifyParsedJson(parsed), parsed };
+  } catch {
+    return { shape: isMalformedToolLikeText(trimmed) ? "MALFORMED_TOOL_LIKE" : "PLAIN_TEXT" };
+  }
+}
+
+/** Classify an entire provider payload up front. */
+export function classifyProviderPayload(input: string | StructuredProviderPayload): ProviderPayloadShape {
+  if (typeof input !== "string") {
+    if (!isPlainObject(input) || input.kind !== "blocks" || Object.keys(input).some(key => key !== "kind" && key !== "blocks") ||
+      !Array.isArray(input.blocks) || input.blocks.length === 0 || !input.blocks.every(block => isPlainObject(block) && block.type === "tool_use")) return "MALFORMED_TOOL_LIKE";
+    return "STANDARD_TOOL";
+  }
+  return classifyString(input).shape;
+}
+
+function parseToolCallEnvelope(raw: string, index: number): ParsedToolCall {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new ProviderProtocolError(
+      "MALFORMED_ENVELOPE_JSON",
+      `pi_tool_call #${index} contains invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new ProviderProtocolError("INVALID_ENVELOPE", `pi_tool_call #${index} is not an object`);
+  }
+  const call = parsed as Record<string, unknown>;
+  for (const key of Object.keys(call)) {
+    if (!ENVELOPE_KEYS.has(key)) {
+      throw new ProviderProtocolError("INVALID_ENVELOPE", `pi_tool_call #${index} has unknown field "${key}"`);
+    }
+  }
+  if (typeof call.name !== "string" || call.name.length === 0) {
+    throw new ProviderProtocolError("INVALID_ENVELOPE", `pi_tool_call #${index} has no non-empty string name`);
+  }
+  if (!call.arguments || typeof call.arguments !== "object" || Array.isArray(call.arguments)) {
+    throw new ProviderProtocolError("INVALID_ENVELOPE", `pi_tool_call #${index} has no object arguments`);
+  }
+  if (call.id !== undefined && (typeof call.id !== "string" || call.id.length === 0)) {
+    throw new ProviderProtocolError("INVALID_ENVELOPE", `pi_tool_call #${index} has a non-string or empty id`);
+  }
+  return { name: call.name as string, arguments: call.arguments as Record<string, unknown>, id: call.id as string | undefined };
+}
+
+/**
+ * Strict bridge contract normalizer.
+ * - Any pi_tool_call marker (even an unclosed one) forces tool-call semantics:
+ *   surrounding prose, a missing close tag, malformed JSON, unknown fields,
+ *   empty/duplicate ids, unlisted tool names, or schema-invalid arguments are
+ *   all ProviderProtocolError — never silently degraded to text.
+ * - Exactly one standard text shape is accepted: a single wrapperless
+ *   {id, type:"function", function:{name, arguments:JSONstring}} envelope.
+ * - Structured input (SDK-native tool_use content blocks) is parsed by the
+ *   native parser into the same common NormalizedToolCall form.
+ * - Any other tool-like payload (tool_calls/function_call/tool_invocation/
+ *   tool_call types, name+arguments objects, malformed JSON with tool
+ *   signals) is a protocol error — never retried, repaired, or downgraded
+ *   to text. Ordinary text and ordinary JSON stay TextResponse.
+ */
+/** Optional instrumentation hook: observes parser selection and each raw
+ *  parse input (boundary D). Exactly one "parser_selected" event fires per
+ *  normalize call; no fallback ever selects a second parser. */
+export type NormalizeInstrument = (stage: "parse_input" | "parser_selected", raw: string, index: number) => void;
+
+const STANDARD_ENVELOPE_KEYS = new Set(["id", "type", "function"]);
+const STANDARD_FUNCTION_KEYS = new Set(["name", "arguments"]);
+const NATIVE_BLOCK_KEYS = new Set(["type", "id", "name", "input"]);
+
+/** Strict parser for the wrapperless OpenAI-style function envelope. */
+function parseStandardFunctionEnvelope(parsed: unknown): ParsedToolCall {
+  if (!isPlainObject(parsed)) {
+    throw new ProviderProtocolError("INVALID_STANDARD_ENVELOPE", "standard tool call is not an object");
+  }
+  for (const key of Object.keys(parsed)) {
+    if (!STANDARD_ENVELOPE_KEYS.has(key)) {
+      throw new ProviderProtocolError("INVALID_STANDARD_ENVELOPE", `standard tool call has unknown field "${key}"`);
+    }
+  }
+  if (parsed.type !== "function") {
+    throw new ProviderProtocolError("INVALID_STANDARD_ENVELOPE", `standard tool call type must be "function", got ${JSON.stringify(parsed.type)}`);
+  }
+  if (typeof parsed.id !== "string" || parsed.id.length === 0) {
+    throw new ProviderProtocolError("INVALID_STANDARD_ENVELOPE", "standard tool call requires a non-empty string id");
+  }
+  const fn = parsed.function;
+  if (!isPlainObject(fn)) {
+    throw new ProviderProtocolError("INVALID_STANDARD_ENVELOPE", "standard tool call function must be an object");
+  }
+  for (const key of Object.keys(fn)) {
+    if (!STANDARD_FUNCTION_KEYS.has(key)) {
+      throw new ProviderProtocolError("INVALID_STANDARD_ENVELOPE", `standard tool call function has unknown field "${key}"`);
+    }
+  }
+  if (typeof fn.name !== "string" || fn.name.length === 0) {
+    throw new ProviderProtocolError("INVALID_STANDARD_ENVELOPE", "standard tool call function requires a non-empty string name");
+  }
+  if (typeof fn.arguments !== "string") {
+    throw new ProviderProtocolError("INVALID_STANDARD_ENVELOPE", "standard tool call function arguments must be a JSON string");
+  }
+  let args: unknown;
+  try {
+    args = JSON.parse(fn.arguments);
+  } catch (error) {
+    throw new ProviderProtocolError(
+      "MALFORMED_ENVELOPE_JSON",
+      `standard tool call arguments are invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (!isPlainObject(args)) {
+    throw new ProviderProtocolError("INVALID_STANDARD_ENVELOPE", "standard tool call arguments must decode to an object");
+  }
+  return { id: parsed.id, name: fn.name, arguments: args };
+}
+
+/** Strict parser for one SDK-native tool_use content block. */
+function parseNativeToolUseBlock(block: unknown, index: number): ParsedToolCall {
+  if (!isPlainObject(block) || block.type !== "tool_use") {
+    throw new ProviderProtocolError("INVALID_NATIVE_TOOL_USE", `native tool_use block #${index} is not a tool_use object`);
+  }
+  for (const key of Object.keys(block)) {
+    if (!NATIVE_BLOCK_KEYS.has(key)) {
+      throw new ProviderProtocolError("INVALID_NATIVE_TOOL_USE", `native tool_use block #${index} has unknown field "${key}"`);
+    }
+  }
+  if (typeof block.id !== "string" || block.id.length === 0) {
+    throw new ProviderProtocolError("INVALID_NATIVE_TOOL_USE", `native tool_use block #${index} requires a non-empty string id`);
+  }
+  if (typeof block.name !== "string" || block.name.length === 0) {
+    throw new ProviderProtocolError("INVALID_NATIVE_TOOL_USE", `native tool_use block #${index} requires a non-empty string name`);
+  }
+  if (!isPlainObject(block.input)) {
+    throw new ProviderProtocolError("INVALID_NATIVE_TOOL_USE", `native tool_use block #${index} requires object input`);
+  }
+  return { id: block.id, name: block.name, arguments: block.input };
+}
+
+/** Qoder pi_tool_call marker path. Owns its parser exclusively — malformed
+ *  marker output is never retried through the standard/generic parser. */
+function normalizeQoderEnvelopeText(
+  text: string,
+  instrument: NormalizeInstrument | undefined,
+): ParsedToolCall[] | ProtocolErrorResponse {
+  const fail = (error: ProviderProtocolError): ProtocolErrorResponse => ({ kind: "protocol_error", error });
+  const matches = [...text.matchAll(TOOL_CALL_RE)];
+  if (matches.length === 0) {
+    return fail(new ProviderProtocolError("UNCLOSED_ENVELOPE", "pi_tool_call marker found without a complete envelope"));
+  }
+  const outside = text.replace(TOOL_CALL_RE, "").trim();
+  if (outside) {
+    return fail(new ProviderProtocolError("PROSE_AROUND_ENVELOPE", "pi_tool_call envelopes must be the entire output; surrounding prose is not allowed"));
+  }
+  try {
+    return matches.map((match, index) => {
+      instrument?.("parse_input", match[1], index + 1);
+      return parseToolCallEnvelope(match[1], index + 1);
     });
+  } catch (error) {
+    if (error instanceof ProviderProtocolError) return fail(error);
+    throw error;
+  }
+}
+
+/** Shared normal-form validation for every parser's calls: id policy,
+ *  duplicates, allowed tool names, and strict uncoerced schema checks. */
+function validateParsedCalls(
+  calls: ParsedToolCall[],
+  parser: ParserKey,
+  tools: readonly Tool[],
+): NormalizedToolCall[] | ProtocolErrorResponse {
+  const fail = (error: ProviderProtocolError): ProtocolErrorResponse => ({ kind: "protocol_error", error });
+  const seen = new Set<string>();
+  const byName = new Map(tools.map((tool) => [tool.name, tool]));
+  const normalized: NormalizedToolCall[] = [];
+  for (const call of calls) {
+    if (call.id !== undefined) {
+      if (seen.has(call.id)) return fail(new ProviderProtocolError("DUPLICATE_ID", `duplicate tool call id "${call.id}"`));
+      seen.add(call.id);
+    }
+    const tool = byName.get(call.name);
+    if (!tool) {
+      return fail(new ProviderProtocolError(
+        "UNKNOWN_TOOL",
+        `Model requested unlisted tool "${call.name}". Allowed: ${tools.map((t) => t.name).join(", ") || "(none)"}`,
+      ));
+    }
+    try {
+      const validated = validateToolCall([tool], { type: "toolCall", id: call.id ?? "_", name: call.name, arguments: call.arguments as JsonObject }) as Record<string, unknown>;
+      if (!isDeepStrictEqual(validated, call.arguments)) throw new Error("Argument coercion is not permitted");
+    } catch (error) {
+      return fail(new ProviderProtocolError(
+        "INVALID_ARGUMENTS",
+        `arguments for "${call.name}" failed schema validation: ${error instanceof Error ? error.message : String(error)}`,
+      ));
+    }
+    if (call.id === undefined && parser !== "qoder_envelope") return fail(new ProviderProtocolError("INVALID_STANDARD_ENVELOPE", "Standard tool call id is required"));
+    // Normalization edge: Qoder envelopes may omit ids (generated here);
+    // standard and native ids are already required non-empty by their parsers.
+    normalized.push({ id: call.id ?? `qoder_${crypto.randomUUID()}`, name: call.name, arguments: call.arguments });
+  }
+  return normalized;
+}
+
+export function normalizeProviderResponse(input: string | StructuredProviderPayload, tools: readonly Tool[], instrument?: NormalizeInstrument): ProviderResponse {
+  const fail = (error: ProviderProtocolError): ProtocolErrorResponse => ({ kind: "protocol_error", error });
+
+  // Structured payload path: SDK-native tool_use content blocks.
+  if (typeof input !== "string") {
+    if (classifyProviderPayload(input) !== "STANDARD_TOOL") return fail(new ProviderProtocolError("UNKNOWN_TOOL_LIKE_FORMAT", "Invalid structured tool payload shape"));
+    instrument?.("parser_selected", "native_tool_use", 0);
+    let calls: ParsedToolCall[];
+    try {
+      calls = input.blocks.map((block, index) => {
+        instrument?.("parse_input", JSON.stringify(block), index + 1);
+        return parseNativeToolUseBlock(block, index + 1);
+      });
+    } catch (error) {
+      if (error instanceof ProviderProtocolError) return fail(error);
+      throw error;
+    }
+    const validated = validateParsedCalls(calls, "native_tool_use", tools);
+    if (!Array.isArray(validated)) return validated;
+    return { kind: "tool_calls", calls: validated, parser: "native_tool_use" };
+  }
+
+  const { shape, parsed } = classifyString(input);
+  if (shape === "PLAIN_TEXT") {
+    instrument?.("parse_input", input, 0);
+    return { kind: "text", text: input };
+  }
+  if (shape === "MALFORMED_TOOL_LIKE") {
+    return fail(new ProviderProtocolError("UNKNOWN_TOOL_LIKE_FORMAT", "Unrecognized tool-call payload shape; refusing to repair or treat as text"));
+  }
+  if (shape === "QODER_TOOL") {
+    instrument?.("parser_selected", "qoder_envelope", 0);
+    const calls = normalizeQoderEnvelopeText(input, instrument);
+    if (!Array.isArray(calls)) return calls;
+    const validated = validateParsedCalls(calls, "qoder_envelope", tools);
+    if (!Array.isArray(validated)) return validated;
+    return { kind: "tool_calls", calls: validated, parser: "qoder_envelope" };
+  }
+  // STANDARD_TOOL: exactly one wrapperless function envelope.
+  instrument?.("parser_selected", "standard_function_envelope", 0);
+  let call: ParsedToolCall;
+  try {
+    instrument?.("parse_input", input, 1);
+    call = parseStandardFunctionEnvelope(parsed);
+  } catch (error) {
+    if (error instanceof ProviderProtocolError) return fail(error);
+    throw error;
+  }
+  const validated = validateParsedCalls([call], "standard_function_envelope", tools);
+  if (!Array.isArray(validated)) return validated;
+  return { kind: "tool_calls", calls: validated, parser: "standard_function_envelope" };
+}
+
+/** Lenient legacy helper kept for callers that predate the strict normalizer. */
+export function parseToolCalls(text: string): ParsedToolCall[] | null {
+  const matches = [...text.matchAll(TOOL_CALL_RE)];
+  if (matches.length === 0) return null;
+  const outside = text.replace(TOOL_CALL_RE, "").trim();
+  if (outside) return null;
+  try {
+    return matches.map((match, index) => parseToolCallEnvelope(match[1], index + 1));
   } catch {
     return null;
   }
+}
+
+/**
+ * Validates continuation structure: the last assistant message's toolCall
+ * blocks must be answered by the following toolResult messages in order,
+ * names matching, ids unique across the whole history, and no toolResult may
+ * reference an unknown or already-consumed call id.
+ */
+export function validateContinuation(messages: readonly Message[]): ProviderProtocolError | undefined {
+  const ids = new Set<string>();
+  let pending: ToolCall[] = [];
+  for (const message of messages) {
+    if (message.role === "toolResult") {
+      const expected = pending.shift();
+      if (!expected) return new ProviderProtocolError("CONTINUATION_ORPHAN_RESULT", "Unexpected or duplicate tool result");
+      if (message.toolCallId !== expected.id) return new ProviderProtocolError("CONTINUATION_ORDER", "toolResult id/order mismatch");
+      if (message.toolName !== expected.name) return new ProviderProtocolError("CONTINUATION_RESULTS_MISMATCH", "Tool result name mismatch");
+      if (typeof message.isError !== "boolean" || !Array.isArray(message.content)) return new ProviderProtocolError("INVALID_TOOL_RESULT", "Invalid tool result content or error flag");
+      continue;
+    }
+    if (pending.length) return new ProviderProtocolError("CONTINUATION_RESULTS_MISMATCH", "Missing tool results before next message");
+    if (message.role === "assistant") {
+      pending = message.content.filter((block): block is ToolCall => block.type === "toolCall");
+      for (const call of pending) {
+        if (!call.id || ids.has(call.id)) return new ProviderProtocolError("DUPLICATE_ID", "Empty or reused tool call id");
+        ids.add(call.id);
+      }
+    }
+  }
+  if (pending.length) return new ProviderProtocolError("CONTINUATION_RESULTS_MISMATCH", "Missing tool results");
+  return undefined;
+}
+
+export function isContinuationContext(context: TranscriptContext): boolean {
+  return context.messages.length > 0 && context.messages[context.messages.length - 1].role === "toolResult";
 }
 
 export function bridgeSystemPrompt(context: TranscriptContext): string {
@@ -352,10 +737,129 @@ function textFromMessage(message: SDKMessage): string {
     .join("");
 }
 
+export const BRIDGE_STATE = {
+  WAITING_PROVIDER: "WAITING_PROVIDER",
+  WAITING_TOOL: "WAITING_TOOL",
+  WAITING_CONTINUATION: "WAITING_CONTINUATION",
+  COMPLETED: "COMPLETED",
+  FAILED: "FAILED",
+} as const;
+export type BridgeState = (typeof BRIDGE_STATE)[keyof typeof BRIDGE_STATE];
+
+type QueryLike = AsyncIterable<SDKMessage> & { close(): Promise<void> };
+
+interface BridgeInternals {
+  queryFactory?: (params: Parameters<typeof query>[0]) => QueryLike;
+  onState?: (state: BridgeState) => void;
+  /** Test hook: receives the same diagnostic events as options.onDiagnostic. */
+  onDiagnostic?: (event: QoderBridgeDiagnosticEvent) => void;
+}
+
+const internals: BridgeInternals = {};
+
+/** Test seam: swap the SDK query factory / observe state. Not part of the public API. */
+export function __setBridgeInternals(patch: BridgeInternals): void {
+  internals.queryFactory = patch.queryFactory;
+  internals.onState = patch.onState;
+  internals.onDiagnostic = patch.onDiagnostic;
+}
+
+/** Options accepted on top of SimpleStreamOptions; parent passes via ProviderStreamOptions extras. */
+export interface QoderBridgeStreamExtras {
+  /** Max silence while awaiting a provider response after Pi tool results. */
+  postToolContinuationTimeoutMs?: number;
+  /** Max wait for any single SDK message while awaiting the provider. */
+  providerMessageTimeoutMs?: number;
+  /** Absolute deadline for the whole stream. */
+  totalDeadlineMs?: number;
+  /**
+   * Per-call provenance sink. Invoked only when debug output is enabled
+   * (QODER_BRIDGE_DEBUG or options.debug enabled); payloads are already
+   * secret-redacted. Callers must treat payloads as read-only.
+   */
+  onDiagnostic?: (event: QoderBridgeDiagnosticEvent) => void;
+  /** Enable redacted Bridge diagnostics and observation of SDK stream_event deltas. */
+  debug?: boolean;
+}
+
+/** Stable diagnostic event shape consumed by the live harness (jsonl per turn). */
+export interface QoderBridgeDiagnosticEvent {
+  label: string;
+  requestId: string;
+  sequence: number;
+  elapsedMs: number;
+  payload: unknown;
+}
+
+/** Timeout classification labels surfaced in errorMessage (prefix before `:`). */
+export const PROVIDER_TIMEOUT_KIND = {
+  /** SDK signalled queue/status with service_available=false before any model event. */
+  UNAVAILABLE: "PROVIDER_UNAVAILABLE",
+  /** Still queued when the bound elapsed (queue messages seen, no model output yet). */
+  QUEUE: "PROVIDER_QUEUE_TIMEOUT",
+  /** Provider started/stayed silent without queue evidence. */
+  RESPONSE: "PROVIDER_RESPONSE_TIMEOUT",
+  /** Silence after Pi tool results were handed off. */
+  CONTINUATION: "POST_TOOL_CONTINUATION_TIMEOUT",
+} as const;
+
+const DEFAULT_POST_TOOL_CONTINUATION_TIMEOUT_MS = 15_000;
+const DEFAULT_PROVIDER_MESSAGE_TIMEOUT_MS = 120_000;
+const DEFAULT_TOTAL_DEADLINE_MS = 300_000;
+const CLOSE_TIMEOUT_MS = 5_000;
+
+const SECRET_KEY_RE = /api[_-]?key|token|secret|password|authorization|credential/i;
+
+function redactValue(value: unknown, extraSecrets: readonly string[], keyPath = ""): unknown {
+  if (typeof value === "string") {
+    let out = value;
+    for (const secret of extraSecrets) {
+      if (secret && out.includes(secret)) out = out.split(secret).join("<redacted>");
+    }
+    if (SECRET_KEY_RE.test(keyPath)) return "<redacted>";
+    return out.replace(/Bearer\s+\S+/gi, "Bearer <redacted>")
+      .replace(/((?:api[_-]?key|token|secret|password|authorization)\s*["']?\s*[:=]\s*["']?)[^"'\s,}]+/gi, "$1<redacted>");
+  }
+  if (Array.isArray(value)) return value.map((entry) => redactValue(entry, extraSecrets, keyPath));
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value)) out[key] = redactValue(entry, extraSecrets, key);
+    return out;
+  }
+  return value;
+}
+
+function debugEnabled(options?: SimpleStreamOptions & QoderBridgeStreamExtras): boolean {
+  if (options?.debug === true) return true;
+  const env = options?.env?.QODER_BRIDGE_DEBUG ?? process.env.QODER_BRIDGE_DEBUG;
+  return env === "1" || env === "true";
+}
+
+function digestOf(value: unknown): string {
+  const serialized = typeof value === "string" ? value : JSON.stringify(value);
+  return createHash("sha256").update(serialized ?? "").digest("hex").slice(0, 16);
+}
+
+type DebugRecorder = (label: string, payload: unknown) => void;
+
+function makeDebug(enabled: boolean, secrets: readonly string[]): DebugRecorder {
+  if (!enabled) return () => {};
+  return (label, payload) => {
+    const safe = redactValue(payload, secrets);
+    let line: string;
+    try {
+      line = JSON.stringify(safe);
+    } catch {
+      line = String(safe);
+    }
+    process.stderr.write(`[qoder-bridge] ${label} ${line}\n`);
+  };
+}
+
 export function streamQoder(
   model: Model<Api>,
   context: TranscriptContext,
-  options?: SimpleStreamOptions,
+  options?: SimpleStreamOptions & QoderBridgeStreamExtras,
 ): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream();
   const output: AssistantMessage = {
@@ -376,27 +880,137 @@ export function streamQoder(
     timestamp: Date.now(),
   };
 
+  const isDebug = debugEnabled(options);
+  const secrets = [options?.apiKey ?? ""].filter((s): s is string => !!s);
+  const debug = makeDebug(isDebug, secrets);
+  const requestId = crypto.randomUUID();
+  let diagSeq = 0;
+  const startedAt = Date.now();
+  const elapsedMs = () => Date.now() - startedAt;
+  // Per-call provenance sink: only invoked in debug mode; payloads are already
+  // secret-redacted. Never a global — a new callback can be supplied per call.
+  const emitDiagnostic = (label: string, payload: unknown) => {
+    if (!isDebug) return;
+    const event: QoderBridgeDiagnosticEvent = {
+      label,
+      requestId,
+      sequence: ++diagSeq,
+      elapsedMs: elapsedMs(),
+      payload: redactValue(payload, secrets),
+    };
+    try { internals.onDiagnostic?.(event); } catch { /* sink must never break the stream */ }
+    try { options?.onDiagnostic?.(event); } catch { /* sink must never break the stream */ }
+  };
+  let state: BridgeState = BRIDGE_STATE.WAITING_PROVIDER;
+  const terminal = () => state === BRIDGE_STATE.COMPLETED || state === BRIDGE_STATE.FAILED;
+  const setState = (next: BridgeState) => {
+    if (state === next) return;
+    if (terminal()) throw new ProviderProtocolError("INVALID_STATE_TRANSITION", `${state} -> ${next}`);
+    // Transition guard: only forward edges are legal.
+    const legal: Record<BridgeState, BridgeState[]> = {
+      WAITING_PROVIDER: [BRIDGE_STATE.WAITING_TOOL, BRIDGE_STATE.WAITING_CONTINUATION, BRIDGE_STATE.COMPLETED, BRIDGE_STATE.FAILED],
+      WAITING_TOOL: [BRIDGE_STATE.WAITING_CONTINUATION, BRIDGE_STATE.COMPLETED, BRIDGE_STATE.FAILED],
+      WAITING_CONTINUATION: [BRIDGE_STATE.WAITING_TOOL, BRIDGE_STATE.COMPLETED, BRIDGE_STATE.FAILED],
+      COMPLETED: [],
+      FAILED: [],
+    };
+    if (!legal[state].includes(next)) throw new ProviderProtocolError("INVALID_STATE_TRANSITION", `${state} -> ${next}`);
+    state = next;
+    internals.onState?.(next);
+    debug("state", next);
+  };
+  // Emit the initial state once so observers always see WAITING_PROVIDER first.
+  internals.onState?.(state);
+  debug("state", state);
+
+  const totalDeadlineMs = options?.totalDeadlineMs ?? DEFAULT_TOTAL_DEADLINE_MS;
+  const remaining = () => Math.max(0, totalDeadlineMs - elapsedMs());
+  const continuation = isContinuationContext(context);
+  const perMessageBound = () => Math.min(continuation ? (options?.postToolContinuationTimeoutMs ?? DEFAULT_POST_TOOL_CONTINUATION_TIMEOUT_MS) : (options?.providerMessageTimeoutMs ?? options?.timeoutMs ?? DEFAULT_PROVIDER_MESSAGE_TIMEOUT_MS), remaining());
+  // Queue/availability signals observed while awaiting the provider, used to
+  // classify a silent-window timeout without conflating it with protocol or
+  // post-tool continuation failures.
+  let sawQueueStatus = false;
+  let sawServiceUnavailable = false;
+  let lastQueueStatus: string | undefined;
+  let lastQueueServiceAvailable: boolean | undefined;
+  let sawFirstMessage = false;
+  let sawFirstModelEvent = false; // assistant / stream_event / result
+  let sawHandoffAck = false; // command_lifecycle reached "started"
+  let firstMessageMs: number | undefined;
+  let firstModelEventMs: number | undefined;
+  let handoffAckMs: number | undefined;
+  let lastQueueElapsedMs: number | undefined;
+  // Queue/availability failures are provider-availability problems, never
+  // protocol or post-tool timeouts — they win over the continuation class.
+  // A later "ready"/available status means the request left the queue, so
+  // subsequent silence is classified normally (continuation / response).
+  const classifyTimeout = (): string => {
+    if (lastQueueServiceAvailable === false) return PROVIDER_TIMEOUT_KIND.UNAVAILABLE;
+    if (lastQueueStatus === "queued" && !sawFirstModelEvent) return PROVIDER_TIMEOUT_KIND.QUEUE;
+    if (continuation) return PROVIDER_TIMEOUT_KIND.CONTINUATION;
+    return PROVIDER_TIMEOUT_KIND.RESPONSE;
+  };
+  const timeoutError = (detail: string) => new Error(`${classifyTimeout()}: ${detail}`);
+
   void (async () => {
     stream.push({ type: "start", partial: output });
     const controller = new AbortController();
     const abort = () => controller.abort();
+    const externalAborted = () => options?.signal?.aborted === true || controller.signal.aborted;
     options?.signal?.addEventListener("abort", abort, { once: true });
-    let q: ReturnType<typeof query> | undefined;
+    let q: QueryLike | undefined;
+    let cleanup: Promise<void> | undefined;
+    const closeQuery = () => cleanup ??= (async () => {
+      if (!q) return;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          Promise.resolve().then(() => q!.close()).catch(error => debug("cleanup_error", String(error))),
+          new Promise<void>(resolve => { timer = setTimeout(() => { debug("cleanup_timeout", CLOSE_TIMEOUT_MS); resolve(); }, CLOSE_TIMEOUT_MS); }),
+        ]);
+      } finally { clearTimeout(timer); }
+    })();
 
     try {
+      // Terminal immediately when the caller's signal is already aborted.
+      if (externalAborted()) throw Object.assign(new Error("Qoder stream aborted before start"), { name: "AbortError" });
+      const structureError = validateContinuation(context.messages);
+      if (structureError) throw structureError;
+      if (continuation) setState(BRIDGE_STATE.WAITING_CONTINUATION);
+      const tools = getCurrentTools(context.messages);
+      debug("request", {
+        model: model.id,
+        continuation,
+        messageCount: context.messages.length,
+        toolNames: tools.map((t) => t.name),
+      });
+
       const resolvedKey = options?.apiKey;
       const auth = resolvedKey && resolvedKey !== LOCAL_AUTH ? accessToken(resolvedKey) : qodercliAuth();
-      q = query({
-        prompt: `PI_CONVERSATION_JSON=${serializeContext(context)}`,
+      const makeQuery = internals.queryFactory ?? ((params: Parameters<typeof query>[0]) => query(params) as unknown as QueryLike);
+      const history = JSON.parse(serializeContext(context));
+      const systemPrompt = bridgeSystemPrompt(context);
+      debug(continuation ? "continuation_request" : "provider_request", {
+        prompt: { PI_CONVERSATION_JSON: history },
+        options: { cwd: process.cwd(), model: model.id, systemPrompt, tools: [], permissionMode: "dontAsk", maxTurns: 1, persistSession: false, maxTokens: options?.maxTokens ?? model.maxTokens, reasoning: options?.reasoning },
+      });
+      for (const message of history) if (message.role === "tool_result") debug("tool_result", message);
+      q = makeQuery({
+        prompt: `PI_CONVERSATION_JSON=${JSON.stringify(history)}`,
         options: {
           auth,
           cwd: process.cwd(),
           model: model.id,
-          systemPrompt: bridgeSystemPrompt(context),
+          systemPrompt,
           tools: [],
           disallowedTools: ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebFetch", "WebSearch", "Agent", "Skill"],
           permissionMode: "dontAsk",
-          includePartialMessages: false,
+          // Debug mode additionally observes raw stream_event deltas. They are
+          // diagnostics ONLY — the single authoritative assembly path is the
+          // final SDK assistant message snapshots; deltas and result.result
+          // echo are never merged into the assembled text.
+          includePartialMessages: isDebug,
           maxTurns: 1,
           extraArgs: {
             "max-output-tokens": String(options?.maxTokens ?? model.maxTokens),
@@ -407,27 +1021,322 @@ export function streamQoder(
         },
       });
 
-      let text = "";
+      // Per-query assembly state. Nothing survives across streamQoder calls,
+      // so continuation turns can never inherit leftover buffers.
+      const assembled = { text: "", offsets: [] as number[], snapshots: [] as Array<{ uuid?: string; messageId?: string; digest: string; sawThinking: boolean; sawText: boolean }> };
+      // Native tool_use blocks collected from assistant snapshots; they join
+      // the SAME normalized-toolcall emission path as text envelopes at B→C.
+      let nativeToolCalls: unknown[] | undefined;
       let result: SDKResultMessage | undefined;
-      for await (const message of q) {
-        if (message.type === "assistant") {
+      let sawTerminal = false;
+      let sawAnyMessage = false;
+      let rawSeq = 0;
+      let afterTerminalDropped = 0;
+      // uuid → content digest for every SDK message that carried a uuid. Same
+      // uuid + same content = transport replay (dedup, never appended twice);
+      // same uuid + different content = strict protocol error.
+      const seenUuids = new Map<string, string>();
+      const finalSnapshots = new Map<string, string>();
+      const iterator = q[Symbol.asyncIterator]();
+      const abortPromise = new Promise<never>((_, reject) => {
+        controller.signal.addEventListener("abort", () => reject(Object.assign(new Error("Qoder stream aborted"), { name: "AbortError" })), { once: true });
+      });
+
+      // The SDK normally ends its iterator after the transport closes. The
+      // observed failure mode is the iterator never resolving `next()` again
+      // after a terminal `result` message. Finish at the terminal result, not
+      // transport EOF. Bound provider silence and the whole turn; continuation
+      // silence is classified separately from initial-provider timeout.
+      while (!sawTerminal) {
+        if (externalAborted()) throw Object.assign(new Error("Qoder stream aborted"), { name: "AbortError" });
+        if (remaining() <= 0) throw timeoutError(`total deadline ${totalDeadlineMs}ms`);
+        let settled: IteratorResult<SDKMessage> | undefined;
+        const nextPromise = iterator.next().then((r) => { settled = r; return r; });
+        const bound = perMessageBound();
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        let raced: "next" | "timeout";
+        try {
+          raced = await Promise.race([
+            nextPromise.then(() => "next" as const),
+            new Promise<"timeout">((resolve) => { timeout = setTimeout(() => resolve("timeout"), Math.max(1, bound)); }),
+            abortPromise,
+          ]);
+        } finally { clearTimeout(timeout); }
+        if (raced === "timeout") {
+          throw timeoutError(`no provider message for ${bound}ms`);
+        }
+        if (settled?.done) break;
+        const message = settled?.value;
+        if (!message) continue;
+        sawAnyMessage = true;
+        rawSeq++;
+        const messageUuid = (message as { uuid?: string }).uuid;
+        const messageDigest = digestOf(message);
+        if (!sawFirstMessage) {
+          sawFirstMessage = true;
+          firstMessageMs = elapsedMs();
+          emitDiagnostic("first_message", { type: message.type, subtype: (message as { subtype?: string }).subtype, firstMessageMs });
+        }
+        // Boundary A: every raw SDK chunk, redacted, before any processing.
+        emitDiagnostic("sdk_raw_message", {
+          boundary: "A",
+          seq: rawSeq,
+          type: message.type,
+          subtype: (message as { subtype?: string }).subtype,
+          uuid: messageUuid,
+          session_id: (message as { session_id?: string }).session_id,
+          digest: messageDigest,
+          assembledOffset: assembled.text.length,
+          message,
+        });
+        debug(continuation ? "continuation_response" : "provider_response", message);
+        // Terminal result already received: never process further chunks.
+        if (sawTerminal) {
+          afterTerminalDropped++;
+          emitDiagnostic("after_terminal_chunk", { seq: rawSeq, type: message.type, uuid: messageUuid, digest: messageDigest });
+          continue;
+        }
+        if (message.type === "system" && (message as { subtype?: string }).subtype === "model_queue_status") {
+          const queue = message as { status?: string; service_available?: boolean; queue_wait_elapsed_ms?: number };
+          sawQueueStatus = true;
+          lastQueueStatus = queue.status;
+          if (queue.service_available !== undefined) lastQueueServiceAvailable = queue.service_available;
+          else if (queue.status === "ready") lastQueueServiceAvailable = undefined;
+          if (queue.service_available === false) sawServiceUnavailable = true;
+          if (typeof queue.queue_wait_elapsed_ms === "number") lastQueueElapsedMs = queue.queue_wait_elapsed_ms;
+          emitDiagnostic("queue_status", { status: queue.status, service_available: queue.service_available, queue_wait_elapsed_ms: queue.queue_wait_elapsed_ms });
+        }
+        if (message.type === "command_lifecycle" && (message as { state?: string }).state === "started") {
+          if (!sawHandoffAck) { sawHandoffAck = true; handoffAckMs = elapsedMs(); emitDiagnostic("handoff_ack", { state: "started", handoffAckMs }); }
+        }
+        if (messageUuid) {
+          const previous = seenUuids.get(messageUuid);
+          if (previous !== undefined) {
+            if (previous !== messageDigest) {
+              throw new ProviderProtocolError("DUPLICATE_UUID", `SDK message uuid ${messageUuid} repeated with different content`);
+            }
+            // Exact replay: record and drop — never append twice.
+            emitDiagnostic("duplicate_uuid", { seq: rawSeq, type: message.type, uuid: messageUuid, action: "dedup" });
+            continue;
+          }
+          seenUuids.set(messageUuid, messageDigest);
+        }
+        const emittedModelContent = message.type === "assistant" && message.message?.content?.some(block =>
+          block.type === "text" && typeof block.text === "string" && block.text.length > 0 || block.type === "thinking" && typeof block.thinking === "string" && block.thinking.length > 0);
+        const delta = message.type === "stream_event" ? message.event?.delta as { type?: string; text?: string; thinking?: string } | undefined : undefined;
+        if (emittedModelContent || delta?.type === "text_delta" && !!delta.text || delta?.type === "thinking_delta" && !!delta.thinking) {
+          // A real model token supersedes earlier queue evidence. Only a new
+          // queue event may classify a subsequent stall as unavailable again.
+          lastQueueServiceAvailable = undefined;
+          lastQueueStatus = undefined;
+        }
+        if (message.type === "stream_event") {
+          // Observation only (includePartialMessages in debug mode). Raw
+          // content_block deltas are NEVER an assembly source.
+          if (!sawFirstModelEvent) { sawFirstModelEvent = true; firstModelEventMs = elapsedMs(); }
+          emitDiagnostic("sdk_stream_event", {
+            seq: rawSeq,
+            eventType: (message as { event?: { type?: string } }).event?.type,
+            digest: messageDigest,
+          });
+        } else if (message.type === "assistant") {
+          if (!sawFirstModelEvent) { sawFirstModelEvent = true; firstModelEventMs = elapsedMs(); }
           if (message.error) throw new Error(`Qoder model error: ${message.error}`);
-          text += textFromMessage(message);
+          if (message.message?.role !== "assistant" || message.message?.type !== "message" || !Array.isArray(message.message.content)) {
+            throw new ProviderProtocolError("INVALID_ASSISTANT_MESSAGE", "Invalid SDK assistant role/type/content");
+          }
+          const blocks = message.message.content;
+          const assistantStop = message.message?.stop_reason;
+          // Dedup finalized message identity before processing native blocks.
+          const snapshotId = message.message.id;
+          if (assistantStop && snapshotId) {
+            const contentDigest = digestOf({ blocks, stopReason: assistantStop });
+            const priorFinal = finalSnapshots.get(snapshotId);
+            if (priorFinal !== undefined) {
+              if (priorFinal !== contentDigest) throw new ProviderProtocolError("DUPLICATE_ASSISTANT_FINAL", "Conflicting final snapshots for one SDK message id");
+              emitDiagnostic("duplicate_final_snapshot", { seq: rawSeq, uuid: messageUuid, messageId: snapshotId, action: "dedup" });
+              continue;
+            }
+            finalSnapshots.set(snapshotId, contentDigest);
+          }
+          // Bridge contract: SDK runtime tools are disabled
+          // (options.tools=[]), but a native tool_use block is still a
+          // supported REQUEST shape — it is normalized to a Pi toolCall and
+          // Pi executes it. SDK-side tool execution is never permitted.
+          const toolUseBlocks = blocks.filter((block) => block.type === "tool_use");
+          const nonToolBlocks = blocks.filter((block) => block.type !== "tool_use");
+          const hasUnknownBlocks = nonToolBlocks.some((block) => block.type !== "text" && block.type !== "thinking");
+          if (hasUnknownBlocks) {
+            throw new ProviderProtocolError(
+              "INVALID_ASSISTANT_CONTENT",
+              "SDK assistant message contains unsupported content block type",
+            );
+          }
+          if (toolUseBlocks.length > 0 && assembled.text.trim() || nativeToolCalls && nonToolBlocks.some(block => block.type === "text" && typeof block.text === "string" && block.text.trim())) {
+            throw new ProviderProtocolError("MIXED_CONTENT", "SDK stream mixes meaningful text with native tool_use across snapshots");
+          }
+          // Mixed-content policy (explicit, never silently dropped):
+          // text/thinking blocks may accompany native tool_use blocks only
+          // when every text block is empty/whitespace. Any meaningful text
+          // mixed with tool_use is an ambiguous shape → strict error.
+          if (toolUseBlocks.length > 0) {
+            const meaningfulText = nonToolBlocks.some((block) =>
+              (block.type === "text" && typeof block.text === "string" && block.text.trim().length > 0) ||
+              (block.type === "thinking" && typeof block.thinking === "string" && block.thinking.trim().length > 0));
+            if (meaningfulText) {
+              throw new ProviderProtocolError(
+                "MIXED_CONTENT",
+                "SDK assistant message mixes meaningful text/thinking with native tool_use blocks",
+              );
+            }
+            if (nativeToolCalls) {
+              throw new ProviderProtocolError(
+                "MIXED_CONTENT",
+                "native tool_use blocks must be confined to a single assistant snapshot",
+              );
+            }
+            nativeToolCalls = toolUseBlocks;
+          }
+          if (assistantStop === "tool_use" && toolUseBlocks.length === 0 && !nativeToolCalls) {
+            throw new ProviderProtocolError(
+              "STOP_REASON_CONTRADICTION",
+              "Qoder assistant stop_reason is " + JSON.stringify(assistantStop) + " without an emitted tool_use block",
+            );
+          }
+          const snapshotText = textFromMessage(message);
+          const snapshot = {
+            uuid: messageUuid,
+            messageId: (message.message as { id?: string }).id,
+            digest: digestOf(blocks),
+            sawThinking: blocks.some((block) => block.type === "thinking"),
+            sawText: blocks.some((block) => block.type === "text"),
+          };
+          assembled.snapshots.push(snapshot);
+          assembled.offsets.push(assembled.text.length);
+          assembled.text += snapshotText;
+          emitDiagnostic("assistant_snapshot", {
+            seq: rawSeq,
+            ...snapshot,
+            offset: assembled.offsets[assembled.offsets.length - 1],
+            text: snapshotText,
+            stop_reason: assistantStop,
+          });
         } else if (message.type === "result") {
+          if (!sawFirstModelEvent) { sawFirstModelEvent = true; firstModelEventMs = elapsedMs(); }
           result = message;
-          if (message.subtype !== "success") throw new Error(message.errors.join("; ") || message.subtype);
-          if (!text) text = clean(message.result);
+          sawTerminal = true;
+          debug("raw_result", {
+            subtype: message.subtype,
+            is_error: message.is_error,
+            stop_reason: message.stop_reason,
+            num_turns: message.num_turns,
+            usage: message.usage,
+          });
+          if (message.subtype !== "success" || message.is_error) throw new Error(("errors" in message ? message.errors?.join("; ") : "") || message.subtype);
+          const resultText = "result" in message && typeof message.result === "string" ? message.result : "";
+          // result.result is an echo of assistant output, never an additional
+          // chunk — it may only fill in when no assistant snapshot arrived.
+          emitDiagnostic("sdk_terminal_result", {
+            seq: rawSeq,
+            uuid: messageUuid,
+            resultText,
+            resultDigest: digestOf(resultText),
+            echoesAssembled: resultText === assembled.text,
+          });
+          if (!nativeToolCalls && !assembled.text) assembled.text = clean(resultText);
         }
       }
+      iterator.return?.().catch(() => undefined);
+      if (afterTerminalDropped) {
+        emitDiagnostic("after_terminal_summary", { dropped: afterTerminalDropped });
+      }
 
+      // EOF without a terminal result is a protocol violation, not a text turn.
+      if (!result) {
+        throw new ProviderProtocolError(
+          "MISSING_RESULT",
+          sawAnyMessage
+            ? "Qoder stream ended without a terminal result message"
+            : "Qoder stream produced no messages at all",
+        );
+      }
       usageFromResult(result, output);
-      const toolCalls = parseToolCalls(text);
-      const allowed = new Set(getCurrentTools(context.messages).map((tool) => tool.name));
-      if (toolCalls && toolCalls.every((call) => allowed.has(call.name))) {
-        for (const call of toolCalls) {
+      const text = assembled.text;
+      // Boundary B: the assembled text is derived exclusively from final SDK
+      // assistant message snapshots. Delta stream_events and the result.result
+      // echo are never merged in.
+      emitDiagnostic("assembled_text", {
+        boundary: "B",
+        text,
+        digest: digestOf(text),
+        length: text.length,
+        snapshots: assembled.snapshots,
+      });
+      debug("raw_text", text);
+      const resultEcho = "result" in result && typeof result.result === "string" ? result.result : "";
+      // PROVIDER_OUTPUT_DEFECT: the SDK boundary delivered text the bridge
+      // contract cannot parse (e.g. a trailing `}` after the JSON payload). We
+      // cannot see inside the SDK/transport, so this records the observation
+      // at boundary A without claiming where the defect originated.
+      const defectDiagnostics = (stage: string, data: string) => {
+        if (!/<\/?pi_tool_call\b/i.test(data)) return;
+        const envelopes = [...data.matchAll(TOOL_CALL_RE)];
+        for (const [index, match] of envelopes.entries()) {
+          try {
+            JSON.parse(match[1]);
+          } catch (error) {
+            emitDiagnostic("provider_output_defect", {
+              stage,
+              envelopeIndex: index + 1,
+              envelopeRaw: match[1],
+              parseError: error instanceof Error ? error.message : String(error),
+              digest: digestOf(data),
+            });
+          }
+        }
+      };
+      defectDiagnostics("assembled_text", text);
+      if (resultEcho && resultEcho !== text) defectDiagnostics("result_echo", resultEcho);
+
+      // Boundaries C (normalization input) and D (per-envelope parse input)
+      // are the same string derived from B; the instrument callback asserts
+      // A→B→C→D equality in tests.
+      // Native tool_use blocks and assembled text share ONE dispatcher:
+      // normalized payload = native blocks when present, else assembled text.
+      const normalizeInput: string | StructuredProviderPayload = nativeToolCalls
+        ? { kind: "blocks", blocks: nativeToolCalls }
+        : text;
+      emitDiagnostic("normalization_input", { boundary: "C", text, digest: digestOf(text), length: text.length, nativeBlocks: nativeToolCalls?.length ?? 0 });
+      const normalized = normalizeProviderResponse(normalizeInput, tools, isDebug
+        ? (stage, raw, index) => emitDiagnostic(stage === "parser_selected" ? "parser_selected" : "parse_input", { boundary: "D", stage, index, raw, digest: digestOf(raw) })
+        : undefined);
+      if (normalized.kind === "tool_calls") {
+        const historicalIds = new Set(context.messages.flatMap(message => message.role === "assistant" ? message.content.filter(block => block.type === "toolCall").map(block => block.id) : []));
+        if (normalized.calls.some(call => historicalIds.has(call.id))) throw new ProviderProtocolError("DUPLICATE_ID", "Provider reused a tool call id from history");
+      }
+      debug("normalized", normalized.kind === "protocol_error" ? { kind: normalized.kind, code: normalized.error.code, message: normalized.error.message } : normalized);
+      if (normalized.kind === "protocol_error") {
+        emitDiagnostic("error_input", { boundary: "E", code: normalized.error.code, message: normalized.error.message, text, inputDigest: digestOf(text) });
+        throw normalized.error;
+      }
+
+      // Stop-reason contradiction: the model emitted envelope tool calls while
+      // the SDK-level stop_reason says the turn ended for another reason, or
+      // vice versa the stop reason demands tool use but none were emitted.
+      const sdkStop = result.stop_reason;
+      if (normalized.kind === "tool_calls" && sdkStop && sdkStop !== "tool_use" && sdkStop !== "end_turn" && sdkStop !== "stop_sequence") {
+        throw new ProviderProtocolError("STOP_REASON_CONTRADICTION", `tool envelopes emitted but SDK stop_reason is ${JSON.stringify(sdkStop)}`);
+      }
+      if (normalized.kind === "text" && sdkStop === "tool_use") {
+        throw new ProviderProtocolError("STOP_REASON_CONTRADICTION", "SDK stop_reason is tool_use but no envelope was emitted");
+      }
+
+      if (normalized.kind === "tool_calls") {
+        setState(BRIDGE_STATE.WAITING_TOOL);
+        for (const call of normalized.calls) {
           const block = {
             type: "toolCall" as const,
-            id: call.id ?? `qoder_${crypto.randomUUID()}`,
+            id: call.id,
             name: call.name,
             arguments: call.arguments as JsonObject,
           };
@@ -435,26 +1344,63 @@ export function streamQoder(
           output.content.push(block);
           stream.push({ type: "toolcall_start", contentIndex, partial: output });
           stream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial: output });
+          debug("tool_call", { id: block.id, name: block.name, arguments: block.arguments });
         }
         output.stopReason = "toolUse";
       } else {
+        const body = normalized.text;
         const contentIndex = output.content.length;
-        output.content.push({ type: "text", text });
+        output.content.push({ type: "text", text: body });
         stream.push({ type: "text_start", contentIndex, partial: output });
-        if (text) stream.push({ type: "text_delta", contentIndex, delta: text, partial: output });
-        stream.push({ type: "text_end", contentIndex, content: text, partial: output });
-        output.stopReason = result?.stop_reason === "max_tokens" ? "length" : "stop";
+        if (body) stream.push({ type: "text_delta", contentIndex, delta: body, partial: output });
+        stream.push({ type: "text_end", contentIndex, content: body, partial: output });
+        output.stopReason = result.stop_reason === "max_tokens" ? "length" : "stop";
       }
+      output.rawStopReason = result.stop_reason ?? undefined;
+      emitDiagnostic("handoff", {
+        stopReason: output.stopReason,
+        rawStopReason: result.stop_reason,
+        firstMessageMs,
+        firstModelEventMs,
+        handoffAckMs,
+        lastQueueElapsedMs,
+        sawQueueStatus,
+        sawServiceUnavailable,
+        afterTerminalDropped,
+      });
+      await closeQuery();
       stream.push({ type: "done", reason: output.stopReason, message: output });
+      if (output.stopReason !== "toolUse") setState(BRIDGE_STATE.COMPLETED);
       stream.end();
     } catch (error) {
-      output.stopReason = controller.signal.aborted ? "aborted" : "error";
+      const isAbort = controller.signal.aborted || (error instanceof Error && error.name === "AbortError");
+      output.stopReason = isAbort ? "aborted" : "error";
       output.errorMessage = error instanceof Error ? error.message : String(error);
+      await closeQuery();
       stream.push({ type: "error", reason: output.stopReason, error: output });
+      setState(BRIDGE_STATE.FAILED);
+      debug("error", output.errorMessage);
+      if (/TIMEOUT/.test(output.errorMessage)) debug("timeout_classification", output.errorMessage.split(":")[0]);
+      if (/UNAVAILABLE|TIMEOUT/.test(output.errorMessage)) {
+        emitDiagnostic("timeout_classification", {
+          kind: output.errorMessage.split(":")[0],
+          sawQueueStatus,
+          sawServiceUnavailable,
+          sawFirstMessage,
+          sawFirstModelEvent,
+          firstMessageMs,
+          firstModelEventMs,
+          handoffAckMs,
+          lastQueueElapsedMs,
+          continuation,
+        });
+      }
       stream.end();
     } finally {
       options?.signal?.removeEventListener("abort", abort);
-      await q?.close().catch(() => undefined);
+      // close() can itself hang if the transport is wedged; bound it and
+      // never let teardown block the terminal event already emitted.
+      await closeQuery();
     }
   })();
 

@@ -5,6 +5,7 @@ node_modules/
 !.env.example
 .pi/
 coverage/
+test-artifacts/
 dist/
 *.tgz
 .DS_Store

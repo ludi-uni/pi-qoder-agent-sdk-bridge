@@ -2,7 +2,7 @@
 
 Use Qoder models in [Pi](https://pi.dev/) through the **official Qoder Agent SDK**. Independent community extension; not affiliated with Qoder or Pi.
 
-> **Release status:** 0.2.1 prepared for npm publication; this version has not been published by this release preparation. `pi-qoder-bridge` is owned by another project, so this package uses the distinct name `pi-qoder-agent-sdk-bridge`.
+> **Release status:** 0.2.2 prepared for npm publication; this version has not been published by this release preparation. `pi-qoder-bridge` is owned by another project, so this package uses the distinct name `pi-qoder-agent-sdk-bridge`.
 
 [日本語の導入ガイド](docs/ja/quickstart.md) · [Qoder SDK](https://docs.qoder.com/cli/sdk/overview) · [Third-party terms](THIRD_PARTY_NOTICES.md)
 
@@ -11,7 +11,7 @@ Use Qoder models in [Pi](https://pi.dev/) through the **official Qoder Agent SDK
 Requirements: Node.js 20+, Pi, and a Qoder account with either a Personal Access Token (PAT) or a signed-in Qoder CLI. Your package manager must allow the Qoder SDK postinstall script to fetch its Worker runtime.
 
 ```sh
-pi install npm:pi-qoder-agent-sdk-bridge@0.2.1
+pi install npm:pi-qoder-agent-sdk-bridge@0.2.2
 pi list
 ```
 
@@ -42,14 +42,14 @@ To load this checkout across Pi sessions, run `pi install <absolute-path-to-this
 - Conversation history and tool schemas are sent to Qoder's service. Input is **text-only**; images are represented as placeholders, not transmitted. The catalog is a static snapshot, not a live per-account availability check.
 - Token costs/prices in model metadata are zero placeholders; actual Qoder billing/credits are governed by your Qoder account. Browser sign-in launched by the CLI is best-effort and can require an interactive terminal.
 - Malformed tool envelopes and unknown tools fail with terminal protocol errors (no automatic repair or retry). SDK terminal results complete the Pi turn without waiting for transport EOF. Post-tool silence is classified as `POST_TOOL_CONTINUATION_TIMEOUT`.
-- Debugging: set `QODER_BRIDGE_DEBUG=1` to emit redacted requests, responses, normalized output, tool calls/results, transitions and timeout classifications to stderr; redirect stderr to save diagnostics. Payload logging is off by default. Debug output may still contain repository content; keep it private. `providerMessageTimeoutMs` (120s), `postToolContinuationTimeoutMs` (15s) and `totalDeadlineMs` (300s) can be set per stream call. Each call is stateless; the full validated Pi transcript is replayed, not a Qoder session resume.
+- Debugging: set `QODER_BRIDGE_DEBUG=1` to emit redacted requests, responses, normalized output, tool calls/results, transitions and timeout classifications to stderr; redirect stderr to save diagnostics. Payload logging is off by default. Debug output may still contain repository content; keep it private. `providerMessageTimeoutMs` (120s), `postToolContinuationTimeoutMs` (15s), `providerQueueTimeoutMs` (120s) and `totalDeadlineMs` (300s) can be set per stream call. While the SDK reports a model queue, the dedicated queue silence bound replaces the normal response/continuation bound so the SDK's 30s polling interval is not cut short. A ready notification or model output restores normal silence monitoring. Queue messages never extend the absolute deadline. Each call is stateless; the full validated Pi transcript is replayed, not a Qoder session resume.
 - Live verification (separate from fixtures): `node --import tsx scripts/verify-provider.mjs`. It uses existing Qoder authentication without changing Pi settings and performs real repository-only reads/listings across three runs. `QODER_BRIDGE_TEST_MODEL` optionally overrides the default `Qwen3.8-Flash`; live checks allow 120s per continuation. Results are saved under `test-artifacts/`.
 
 ## Tool envelope dispatch
 
 Payload shape selects exactly one strict parser; a parse failure never tries another parser or completes as text. Supported shapes:
 
-- Qoder: `<pi_tool_call>{"id":"call_1","name":"read","arguments":{"path":"package.json"}}</pi_tool_call>`. Qoder IDs remain optional (generated when omitted). Text outside complete envelopes (including commentary or stray `}`) is ignored, not emitted or executed. Extra incomplete/malformed markers and invalid JSON inside envelopes still fail; no JSON repair is performed.
+- Qoder: `<pi_tool_call>{"id":"call_1","name":"read","arguments":{"path":"package.json"}}</pi_tool_call>`. Qoder IDs remain optional (generated when omitted). Text outside complete envelopes (including commentary or stray `}`) is ignored, not emitted or executed. Envelope boundaries recognize JSON strings and escapes, so literal `<pi_tool_call>` / `</pi_tool_call>` inside argument strings are preserved. Markdown code spans and code blocks in explanatory prose are literal examples, not executable calls (including quoted template envelopes such as `tool_name`). This also preserves tag mentions such as `</pi_tool_call>` or `const close = "</pi_tool_call>";`. Unquoted envelopes and code-only responses beginning with JSON-like envelopes still undergo strict tool validation; unknown tools are never enabled by this rule. Extra incomplete/malformed markers and invalid JSON inside envelopes still fail; no JSON repair is performed.
 - SDK-native assistant content block: `{"type":"tool_use","id":"call_1","name":"read","input":{"path":"package.json"}}`.
 - Wrapperless function envelope as the entire assistant text: `{"id":"call_1","type":"function","function":{"name":"read","arguments":"{\"path\":\"package.json\"}"}}`.
 

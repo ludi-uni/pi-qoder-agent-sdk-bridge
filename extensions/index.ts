@@ -328,8 +328,54 @@ export type ToolCallResponse = { kind: "tool_calls"; calls: NormalizedToolCall[]
 export type ProtocolErrorResponse = { kind: "protocol_error"; error: ProviderProtocolError };
 export type ProviderResponse = TextResponse | ToolCallResponse | ProtocolErrorResponse;
 
-const TOOL_CALL_RE = /<pi_tool_call>\s*([\s\S]*?)\s*<\/pi_tool_call>/g;
+const TOOL_CALL_OPEN = "<pi_tool_call>";
+const TOOL_CALL_CLOSE = "</pi_tool_call>";
 const ENVELOPE_KEYS = new Set(["name", "arguments", "id"]);
+
+/** Markdown code in a prose answer is an example, not a tool request.
+ * A code-only response starting with a JSON-like envelope still dispatches
+ * strictly (including malformed envelopes). Masking preserves source offsets. */
+function maskCodeLiteralToolMarkers(text: string): string {
+  const codeSpans = /(`+)([\s\S]*?)\1(?!`)/g;
+  const codeOnly = text.replace(codeSpans, "").trim().length === 0;
+  return text.replace(codeSpans, (literal: string, _delimiter: string, code: string) => {
+    if (codeOnly && /^(?:[\w+-]+\r?\n)?\s*<pi_tool_call\b(?:\s*>|\s+)?\s*[\[{]/i.test(code.trim())) return literal;
+    return " ".repeat(literal.length);
+  });
+}
+
+/** Find envelope boundaries outside JSON strings; JSON.parse still validates the payload. */
+function scanToolCallEnvelopes(text: string): { envelopes: string[]; error?: ProviderProtocolError } {
+  const envelopes: string[] = [];
+  const markers = /<\/?pi_tool_call\b/gi;
+  const incomplete = () => ({ envelopes, error: new ProviderProtocolError("UNCLOSED_ENVELOPE", "pi_tool_call marker found without a complete envelope") });
+  const markerText = maskCodeLiteralToolMarkers(text);
+  let marker: RegExpExecArray | null;
+  while ((marker = markers.exec(markerText))) {
+    if (!text.startsWith(TOOL_CALL_OPEN, marker.index)) return incomplete();
+    const start = marker.index + TOOL_CALL_OPEN.length;
+    let inString = false;
+    let escaped = false;
+    let closed = false;
+    for (let index = start; index < text.length; index++) {
+      const char = text[index];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (char === "\\") escaped = true;
+        else if (char === '"') inString = false;
+      } else if (char === '"') {
+        inString = true;
+      } else if (text.startsWith(TOOL_CALL_CLOSE, index)) {
+        envelopes.push(text.slice(start, index).trim());
+        markers.lastIndex = index + TOOL_CALL_CLOSE.length;
+        closed = true;
+        break;
+      }
+    }
+    if (!closed) return incomplete();
+  }
+  return envelopes.length ? { envelopes } : incomplete();
+}
 
 // --- Up-front input-shape classifier ---
 // Every provider payload (assembled text or structured native blocks) is
@@ -395,7 +441,7 @@ function classifyParsedJson(value: unknown): ProviderPayloadShape {
 /** Internal classify that also returns the already-parsed JSON value. */
 function classifyString(input: string): { shape: ProviderPayloadShape; parsed?: unknown } {
   // Qoder marker recognition has priority over malformed-JSON detection.
-  if (/<\/?pi_tool_call\b/i.test(input)) return { shape: "QODER_TOOL" };
+  if (/<\/?pi_tool_call\b/i.test(maskCodeLiteralToolMarkers(input))) return { shape: "QODER_TOOL" };
   const trimmed = input.trim();
   if (!trimmed) return { shape: "PLAIN_TEXT" };
   try {
@@ -449,7 +495,8 @@ function parseToolCallEnvelope(raw: string, index: number): ParsedToolCall {
 
 /**
  * Strict bridge contract normalizer.
- * - Any pi_tool_call marker (even an unclosed one) forces tool-call semantics:
+ * - Any pi_tool_call marker (except literal tag mentions in Markdown code)
+ *   forces tool-call semantics, even if unclosed:
  *   a missing close tag, malformed JSON, unknown fields,
  *   empty/duplicate ids, unlisted tool names, or schema-invalid arguments are
  *   all ProviderProtocolError — never silently degraded to text.
@@ -547,19 +594,12 @@ function normalizeQoderEnvelopeText(
   instrument: NormalizeInstrument | undefined,
 ): ParsedToolCall[] | ProtocolErrorResponse {
   const fail = (error: ProviderProtocolError): ProtocolErrorResponse => ({ kind: "protocol_error", error });
-  const matches = [...text.matchAll(TOOL_CALL_RE)];
-  if (matches.length === 0) {
-    return fail(new ProviderProtocolError("UNCLOSED_ENVELOPE", "pi_tool_call marker found without a complete envelope"));
-  }
-  const outside = text.replace(TOOL_CALL_RE, "").trim();
-  // Ignore commentary, but never hide an incomplete or malformed extra marker.
-  if (/<\/?pi_tool_call\b/i.test(outside)) {
-    return fail(new ProviderProtocolError("UNCLOSED_ENVELOPE", "pi_tool_call marker found outside a complete envelope"));
-  }
+  const scanned = scanToolCallEnvelopes(text);
+  if (scanned.error) return fail(scanned.error);
   try {
-    return matches.map((match, index) => {
-      instrument?.("parse_input", match[1], index + 1);
-      return parseToolCallEnvelope(match[1], index + 1);
+    return scanned.envelopes.map((raw, index) => {
+      instrument?.("parse_input", raw, index + 1);
+      return parseToolCallEnvelope(raw, index + 1);
     });
   } catch (error) {
     if (error instanceof ProviderProtocolError) return fail(error);
@@ -763,8 +803,10 @@ export function __setBridgeInternals(patch: BridgeInternals): void {
 export interface QoderBridgeStreamExtras {
   /** Max silence while awaiting a provider response after Pi tool results. */
   postToolContinuationTimeoutMs?: number;
-  /** Max wait for any single SDK message while awaiting the provider. */
+  /** Max silence awaiting an initial provider response outside a queue. */
   providerMessageTimeoutMs?: number;
+  /** Max silence while the SDK reports a model queue; absolute deadline still applies. */
+  providerQueueTimeoutMs?: number;
   /** Absolute deadline for the whole stream. */
   totalDeadlineMs?: number;
   /**
@@ -800,6 +842,7 @@ export const PROVIDER_TIMEOUT_KIND = {
 
 const DEFAULT_POST_TOOL_CONTINUATION_TIMEOUT_MS = 15_000;
 const DEFAULT_PROVIDER_MESSAGE_TIMEOUT_MS = 120_000;
+const DEFAULT_PROVIDER_QUEUE_TIMEOUT_MS = 120_000;
 const DEFAULT_TOTAL_DEADLINE_MS = 300_000;
 const CLOSE_TIMEOUT_MS = 5_000;
 
@@ -921,7 +964,15 @@ export function streamQoder(
   const totalDeadlineMs = options?.totalDeadlineMs ?? DEFAULT_TOTAL_DEADLINE_MS;
   const remaining = () => Math.max(0, totalDeadlineMs - elapsedMs());
   const continuation = isContinuationContext(context);
-  const perMessageBound = () => Math.min(continuation ? (options?.postToolContinuationTimeoutMs ?? DEFAULT_POST_TOOL_CONTINUATION_TIMEOUT_MS) : (options?.providerMessageTimeoutMs ?? options?.timeoutMs ?? DEFAULT_PROVIDER_MESSAGE_TIMEOUT_MS), remaining());
+  let waitingInQueue = false;
+  const perMessageBound = () => Math.min(
+    waitingInQueue
+      ? (options?.providerQueueTimeoutMs ?? DEFAULT_PROVIDER_QUEUE_TIMEOUT_MS)
+      : continuation
+        ? (options?.postToolContinuationTimeoutMs ?? DEFAULT_POST_TOOL_CONTINUATION_TIMEOUT_MS)
+        : (options?.providerMessageTimeoutMs ?? options?.timeoutMs ?? DEFAULT_PROVIDER_MESSAGE_TIMEOUT_MS),
+    remaining(),
+  );
   // Queue/availability signals observed while awaiting the provider, used to
   // classify a silent-window timeout without conflating it with protocol or
   // post-tool continuation failures.
@@ -1094,6 +1145,9 @@ export function streamQoder(
         if (message.type === "system" && (message as { subtype?: string }).subtype === "model_queue_status") {
           const queue = message as { status?: string; service_available?: boolean; queue_wait_elapsed_ms?: number };
           sawQueueStatus = true;
+          // A queued request may be silent for the SDK's 30s polling interval.
+          // Do not apply the ordinary 15s continuation bound until it is ready.
+          waitingInQueue = queue.status !== "ready" && (queue.status === "queued" || queue.service_available === false);
           lastQueueStatus = queue.status;
           if (queue.service_available !== undefined) lastQueueServiceAvailable = queue.service_available;
           else if (queue.status === "ready") lastQueueServiceAvailable = undefined;
@@ -1117,11 +1171,12 @@ export function streamQoder(
           seenUuids.set(messageUuid, messageDigest);
         }
         const emittedModelContent = message.type === "assistant" && message.message?.content?.some(block =>
-          block.type === "text" && typeof block.text === "string" && block.text.length > 0 || block.type === "thinking" && typeof block.thinking === "string" && block.thinking.length > 0);
+          block.type === "tool_use" || block.type === "text" && typeof block.text === "string" && block.text.length > 0 || block.type === "thinking" && typeof block.thinking === "string" && block.thinking.length > 0);
         const delta = message.type === "stream_event" ? message.event?.delta as { type?: string; text?: string; thinking?: string } | undefined : undefined;
         if (emittedModelContent || delta?.type === "text_delta" && !!delta.text || delta?.type === "thinking_delta" && !!delta.thinking) {
           // A real model token supersedes earlier queue evidence. Only a new
           // queue event may classify a subsequent stall as unavailable again.
+          waitingInQueue = false;
           lastQueueServiceAvailable = undefined;
           lastQueueStatus = undefined;
         }
@@ -1275,15 +1330,15 @@ export function streamQoder(
       // at boundary A without claiming where the defect originated.
       const defectDiagnostics = (stage: string, data: string) => {
         if (!/<\/?pi_tool_call\b/i.test(data)) return;
-        const envelopes = [...data.matchAll(TOOL_CALL_RE)];
-        for (const [index, match] of envelopes.entries()) {
+        const { envelopes } = scanToolCallEnvelopes(data);
+        for (const [index, raw] of envelopes.entries()) {
           try {
-            JSON.parse(match[1]);
+            JSON.parse(raw);
           } catch (error) {
             emitDiagnostic("provider_output_defect", {
               stage,
               envelopeIndex: index + 1,
-              envelopeRaw: match[1],
+              envelopeRaw: raw,
               parseError: error instanceof Error ? error.message : String(error),
               digest: digestOf(data),
             });

@@ -35,7 +35,7 @@ const READ_TOOL: Tool = {
 } as unknown as Tool;
 const TOOLS = [READ_TOOL];
 
-const FAST: Record<string, unknown> = { postToolContinuationTimeoutMs: 60, providerMessageTimeoutMs: 60, totalDeadlineMs: 5_000 };
+const FAST: Record<string, unknown> = { postToolContinuationTimeoutMs: 60, providerMessageTimeoutMs: 60, providerQueueTimeoutMs: 60, totalDeadlineMs: 5_000 };
 const DEBUG_FAST: Record<string, unknown> = { ...FAST, env: { QODER_BRIDGE_DEBUG: "0" }, debug: true };
 
 function resultMessage(overrides: Partial<SDKResultMessage> = {}, uuid = "u1"): SDKResultMessage {

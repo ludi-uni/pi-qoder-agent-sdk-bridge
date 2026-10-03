@@ -1,6 +1,6 @@
 {
   "name": "pi-qoder-agent-sdk-bridge",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Pi extension that bridges the Qoder Agent SDK (official @qoder-ai/qoder-agent-sdk) into Pi as a model provider",
   "license": "MIT",
   "type": "module",

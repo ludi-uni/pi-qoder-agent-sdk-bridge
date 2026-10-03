@@ -1,9 +1,10 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   accessToken,
   qodercliAuth,
@@ -304,6 +305,60 @@ export interface ParsedToolCall {
   name: string;
   arguments: Record<string, unknown>;
   id?: string;
+}
+
+export type QoderCapabilityStatus = "SUPPORTED" | "UNSUPPORTED" | "UNVERIFIED";
+
+const QODER_CAPABILITY_KEYS = [
+  "native_tool_use_parse",
+  "native_single_identity",
+  "native_parallel_identity",
+  "native_host_owned_execution",
+  "native_pretooluse_defer",
+  "native_pi_approval_integration",
+  "native_ambient_execution_closure",
+  "native_sequential_production_path",
+] as const;
+export type QoderCapability = typeof QODER_CAPABILITY_KEYS[number];
+
+// Read the installed SDK version, not the bridge's version or a semver range.
+// Failure to identify the package is deliberately not an audited version.
+export function installedQoderSdkVersion(): string {
+  try {
+    const entry = createRequire(import.meta.url).resolve("@qoder-ai/qoder-agent-sdk");
+    const pkg: unknown = JSON.parse(readFileSync(join(dirname(entry), "..", "package.json"), "utf8"));
+    if (isPlainObject(pkg) && pkg.name === "@qoder-ai/qoder-agent-sdk" && typeof pkg.version === "string") return pkg.version;
+  } catch { /* fail closed to an unverified version */ }
+  return "UNKNOWN";
+}
+
+/** Parse/identity support does NOT establish execution/approval ownership.
+ * New versions start entirely UNVERIFIED; promotions require a new audit. */
+export function qoderCapabilityRegistry(sdkVersion = installedQoderSdkVersion()): {
+  readonly sdkVersion: string;
+  readonly capabilities: Readonly<Record<QoderCapability, QoderCapabilityStatus>>;
+} {
+  const capabilities = Object.fromEntries(QODER_CAPABILITY_KEYS.map(key => [key,
+    sdkVersion === "1.0.32" && (key === "native_tool_use_parse" || key === "native_single_identity" || key === "native_parallel_identity")
+      ? "SUPPORTED" : "UNVERIFIED",
+  ])) as Record<QoderCapability, QoderCapabilityStatus>;
+  return Object.freeze({ sdkVersion, capabilities: Object.freeze(capabilities) });
+}
+
+export const QODER_NATIVE_FALLBACK_REASONS = Object.freeze({
+  native_host_owned_execution: "SDK_NATIVE_HOST_EXECUTION_UNVERIFIED",
+  native_pretooluse_defer: "SDK_NATIVE_DEFER_UNVERIFIED",
+  native_pi_approval_integration: "SDK_NATIVE_APPROVAL_UNVERIFIED",
+  native_sequential_production_path: "SDK_NATIVE_SEQUENTIAL_UNVERIFIED",
+  native_ambient_execution_closure: "SDK_AMBIENT_EXECUTION_CLOSURE_UNVERIFIED",
+} as const);
+export type QoderNativeFallbackReason = typeof QODER_NATIVE_FALLBACK_REASONS[keyof typeof QODER_NATIVE_FALLBACK_REASONS];
+
+/** Classification only; a reason is NOT permission to normalize/execute a call.
+ * Closure must be established before starting the SDK, not inferred afterwards. */
+export function qoderNativeFallbackReasons(sdkVersion: string, requirements: readonly (keyof typeof QODER_NATIVE_FALLBACK_REASONS)[]): QoderNativeFallbackReason[] {
+  const { capabilities } = qoderCapabilityRegistry(sdkVersion);
+  return [...new Set(requirements.filter(key => capabilities[key] !== "SUPPORTED").map(key => QODER_NATIVE_FALLBACK_REASONS[key]))];
 }
 
 export class ProviderProtocolError extends Error {
@@ -1021,6 +1076,25 @@ export function streamQoder(
     try {
       // Terminal immediately when the caller's signal is already aborted.
       if (externalAborted()) throw Object.assign(new Error("Qoder stream aborted before start"), { name: "AbortError" });
+      // Opt-in native fallback is blocked BEFORE SDK startup while execution
+      // closure is unverified. tools:[]/dontAsk/maxTurns are not closure proof.
+      // No query retry, SDK hook/defer, parser fallback or executor is introduced.
+      if ((options?.env?.QODER_UNVERIFIED_NATIVE_FALLBACK ?? process.env.QODER_UNVERIFIED_NATIVE_FALLBACK) === "1") {
+        const registry = qoderCapabilityRegistry();
+        const reasons = qoderNativeFallbackReasons(registry.sdkVersion, ["native_ambient_execution_closure"]);
+        emitDiagnostic("native_fallback_blocked", {
+          sdkVersion: registry.sdkVersion,
+          fallbackReason: reasons[0],
+          generationId: null,
+          nativeCallId: null,
+          normalizedCallId: null,
+          toolName: null,
+          approvalOutcome: "NOT_REQUESTED",
+          executionOutcome: "NOT_STARTED",
+        });
+        throw new ProviderProtocolError("SDK_AMBIENT_EXECUTION_CLOSURE_UNVERIFIED",
+          "SDK_AMBIENT_EXECUTION_CLOSURE_UNVERIFIED: native fallback cannot start safely; no supported request-only SDK execution boundary is established");
+      }
       const structureError = validateContinuation(context.messages);
       if (structureError) throw structureError;
       if (continuation) setState(BRIDGE_STATE.WAITING_CONTINUATION);
@@ -1209,10 +1283,10 @@ export function streamQoder(
             }
             finalSnapshots.set(snapshotId, contentDigest);
           }
-          // Bridge contract: SDK runtime tools are disabled
-          // (options.tools=[]), but a native tool_use block is still a
-          // supported REQUEST shape — it is normalized to a Pi toolCall and
-          // Pi executes it. SDK-side tool execution is never permitted.
+          // Legacy normalization accepts the native REQUEST shape and emits
+          // a Pi toolCall. tools:[] alone is NOT proof that ambient SDK execution
+          // is closed. The opt-in fallback gate above therefore blocks SDK
+          // startup; this flag-off path is unchanged, not newly safety-certified.
           const toolUseBlocks = blocks.filter((block) => block.type === "tool_use");
           const nonToolBlocks = blocks.filter((block) => block.type !== "tool_use");
           const hasUnknownBlocks = nonToolBlocks.some((block) => block.type !== "text" && block.type !== "thinking");

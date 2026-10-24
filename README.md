@@ -2,16 +2,16 @@
 
 Use Qoder models in [Pi](https://pi.dev/) through the **official Qoder Agent SDK**. Independent community extension; not affiliated with Qoder or Pi.
 
-> **Release status:** this checkout is version 0.4.0 (see `package.json`). Its npm publication status is not asserted here; confirm the version is actually published before using the npm install command below. `pi-qoder-bridge` is owned by another project, so this package uses the distinct name `pi-qoder-agent-sdk-bridge`.
+> **Release status:** this checkout is version 0.5.0 (see `package.json`). Its npm publication status is not asserted here; confirm the version is actually published before using the npm install command below. `pi-qoder-bridge` is owned by another project, so this package uses the distinct name `pi-qoder-agent-sdk-bridge`.
 
 [日本語の導入ガイド](docs/ja/quickstart.md) · [Qoder SDK](https://docs.qoder.com/cli/sdk/overview) · [Third-party terms](THIRD_PARTY_NOTICES.md)
 
 ## Install (after the corresponding version is published to npm)
 
-Requirements: Node.js >= 22.23.4 (per `engines` in `package.json`), Pi, and a Qoder account with either a Personal Access Token (PAT) or a signed-in Qoder CLI. Your package manager must allow the Qoder SDK postinstall script to fetch its Worker runtime. Verify that the version you want is actually published on npm before running the command — this checkout's version, 0.4.0, is not asserted to be published.
+Requirements: Node.js >= 22.23.4 (per `engines` in `package.json`), Pi, and a Qoder account with either a Personal Access Token (PAT) or a signed-in Qoder CLI. Your package manager must allow the Qoder SDK postinstall script to fetch its Worker runtime. Verify that the version you want is actually published on npm before running the command — this checkout's version, 0.5.0, is not asserted to be published.
 
 ```sh
-pi install npm:pi-qoder-agent-sdk-bridge@0.4.0
+pi install npm:pi-qoder-agent-sdk-bridge@0.5.0
 pi list
 ```
 

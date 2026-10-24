@@ -1,13 +1,13 @@
-# Pi × Qoder 導入ガイド（0.4.0）
+# Pi × Qoder 導入ガイド（0.5.0）
 
-> このチェックアウトのバージョンは 0.4.0 です（`package.json` 参照）。npm に公開済みかどうかはここでは断言しません。利用したいバージョンの公開を確認するまでは [README のローカル導入](../../README.md#try-a-local-checkout)を使い、0.4.0 の公開を確認した後で下記の npm コマンドを使用できます。Qoder / Pi の公式製品ではありません。
+> このチェックアウトのバージョンは 0.5.0 です（`package.json` 参照）。npm に公開済みかどうかはここでは断言しません。利用したいバージョンの公開を確認するまでは [README のローカル導入](../../README.md#try-a-local-checkout)を使い、0.5.0 の公開を確認した後で下記の npm コマンドを使用できます。Qoder / Pi の公式製品ではありません。
 
 ## 1. インストール
 
 Node.js 22.23.4 以上（`package.json` の `engines` 参照）と Pi が必要です。Qoder Agent SDK のインストール時には Worker runtime を取得する `postinstall` の実行許可が必要です。
 
 ```sh
-pi install npm:pi-qoder-agent-sdk-bridge@0.4.0
+pi install npm:pi-qoder-agent-sdk-bridge@0.5.0
 pi list
 ```
 

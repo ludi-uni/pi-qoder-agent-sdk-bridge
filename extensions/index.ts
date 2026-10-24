@@ -9,6 +9,12 @@ import {
   accessToken,
   qodercliAuth,
   query,
+  CONTROL_REQUEST_TIMEOUT_CODE,
+  ControlRequestError,
+  ModelPolicyTimeoutError,
+  ProtocolVersionMismatchError,
+  UnsupportedCliCapabilityError,
+  type SDKAgentsMdSizeWarningMessage,
   type SDKMessage,
   type SDKResultMessage,
 } from "@qoder-ai/qoder-agent-sdk";
@@ -387,49 +393,123 @@ const TOOL_CALL_OPEN = "<pi_tool_call>";
 const TOOL_CALL_CLOSE = "</pi_tool_call>";
 const ENVELOPE_KEYS = new Set(["name", "arguments", "id"]);
 
+/** Tag-name signal for an attempted tool-call transport that is NOT the
+ *  contract tag: tool_call(s), function_call(s), tool_invocation, tool_use
+ *  or invoke, with any prefix/suffix (numbered variants like tool_call_1
+ *  or renamed tags like pi_tool_call_2). These are refused outright — never
+ *  executed as an alias of the pi_tool_call envelope. */
+const FOREIGN_TOOL_TAG_RE = /(?:^|[_:.-])(?:tool_calls?|function_calls?|tool_invocation|tool_use|invoke)(?:$|[_:.-])/i;
+
+/** A code-only response that starts with a tag-shaped JSON-like invocation
+ *  (contract tag or foreign tool-call tag) still dispatches strictly. */
+const CODE_INVOCATION_RE = /^(?:[\w+-]+\r?\n)?\s*<[\w:.-]*?(?:tool_calls?|function_calls?|tool_invocation|tool_use|invoke)[\w:.-]*\s*>?\s*[\[{]/i;
+
 /** Markdown code in a prose answer is an example, not a tool request.
  * A code-only response starting with a JSON-like envelope still dispatches
  * strictly (including malformed envelopes). Masking preserves source offsets. */
 function maskCodeLiteralToolMarkers(text: string): string {
   const codeSpans = /(`+)([\s\S]*?)\1(?!`)/g;
   const codeOnly = text.replace(codeSpans, "").trim().length === 0;
-  return text.replace(codeSpans, (literal: string, _delimiter: string, code: string) => {
-    if (codeOnly && /^(?:[\w+-]+\r?\n)?\s*<pi_tool_call\b(?:\s*>|\s+)?\s*[\[{]/i.test(code.trim())) return literal;
+  const maskedCode = text.replace(codeSpans, (literal: string, _delimiter: string, code: string) => {
+    if (codeOnly) {
+      const trimmed = code.trim();
+      const emptyEnvelope = trimmed.replace(/^[\w+-]+\r?\n/, "").match(/^<([\w:.-]+)>\s*<\/\1>$/i);
+      if (CODE_INVOCATION_RE.test(trimmed) || (emptyEnvelope && FOREIGN_TOOL_TAG_RE.test(emptyEnvelope[1]) && emptyEnvelope[1].toLowerCase() !== "pi_tool_call")) return literal;
+    }
     return " ".repeat(literal.length);
   });
+  // Reported grep patterns may use ordinary quotes instead of Markdown.
+  // Mask only a quoted closing-tag literal, never a quoted invocation.
+  return maskedCode.replace(/(["'])\s*<\/pi_tool_call>\s*\1/gi, literal => " ".repeat(literal.length));
 }
 
-/** Find envelope boundaries outside JSON strings; JSON.parse still validates the payload. */
-function scanToolCallEnvelopes(text: string): { envelopes: string[]; error?: ProviderProtocolError } {
+/** Find envelope boundaries outside JSON strings; JSON.parse still validates
+ *  the payload. The scan walks the (code-masked) text once with JSON-string
+ *  awareness: tags inside string values — of a complete envelope or of a
+ *  JSON-looking {} / [] fragment in prose — are data, never markers. Any
+ *  <tag> whose name signals a tool-call transport but is not the exact
+ *  contract tag is rejected as UNKNOWN_TOOL_LIKE_FORMAT, including when it
+ *  appears next to a valid envelope. */
+function scanToolCallEnvelopes(text: string): { envelopes: string[]; sawPiMarker: boolean; error?: ProviderProtocolError } {
   const envelopes: string[] = [];
-  const markers = /<\/?pi_tool_call\b/gi;
-  const incomplete = () => ({ envelopes, error: new ProviderProtocolError("UNCLOSED_ENVELOPE", "pi_tool_call marker found without a complete envelope") });
+  const tag = /<\/?([\w:.-]+)(?:\s[^>]*)?>/y;
+  const piMarker = /<\/?pi_tool_call\b/iy;
   const markerText = maskCodeLiteralToolMarkers(text);
-  let marker: RegExpExecArray | null;
-  while ((marker = markers.exec(markerText))) {
-    if (!text.startsWith(TOOL_CALL_OPEN, marker.index)) return incomplete();
-    const start = marker.index + TOOL_CALL_OPEN.length;
-    let inString = false;
-    let escaped = false;
-    let closed = false;
-    for (let index = start; index < text.length; index++) {
-      const char = text[index];
-      if (inString) {
-        if (escaped) escaped = false;
-        else if (char === "\\") escaped = true;
-        else if (char === '"') inString = false;
-      } else if (char === '"') {
-        inString = true;
-      } else if (text.startsWith(TOOL_CALL_CLOSE, index)) {
-        envelopes.push(text.slice(start, index).trim());
-        markers.lastIndex = index + TOOL_CALL_CLOSE.length;
-        closed = true;
-        break;
-      }
+  let sawPiMarker = false;
+  const fail = (error: ProviderProtocolError) => ({ envelopes, sawPiMarker, error });
+  const incomplete = () => fail(new ProviderProtocolError("UNCLOSED_ENVELOPE", "pi_tool_call marker found without a complete envelope"));
+  let inString = false;
+  let escaped = false;
+  let depth = 0;
+  for (let index = 0; index < markerText.length; index++) {
+    const char = markerText[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      // A raw newline can never appear inside a real JSON string — a bogus
+      // opener must not be able to hide a genuine marker that follows.
+      else if (char === "\n" || char === "\r") inString = false;
+      continue;
     }
-    if (!closed) return incomplete();
+    if (char === '"') {
+      // Only strings inside a JSON-looking {}/[] region count as data; a
+      // quote in ordinary prose must not be able to hide a real marker.
+      if (depth > 0) inString = true;
+      continue;
+    }
+    if (char === "{" || char === "[") { depth++; continue; }
+    if (char === "}" || char === "]") { if (depth > 0) depth--; continue; }
+    if (char !== "<") continue;
+    piMarker.lastIndex = index;
+    if (piMarker.exec(markerText) && !text.startsWith(TOOL_CALL_OPEN, index)) {
+      sawPiMarker = true;
+      return incomplete();
+    }
+    tag.lastIndex = index;
+    const marker = tag.exec(markerText);
+    if (!marker) continue;
+    const name = marker[1];
+    if (name.toLowerCase() === "pi_tool_call") {
+      sawPiMarker = true;
+      if (!text.startsWith(TOOL_CALL_OPEN, index)) return incomplete();
+      const start = index + TOOL_CALL_OPEN.length;
+      let payloadInString = false;
+      let payloadEscaped = false;
+      let closed = false;
+      for (let cursor = start; cursor < text.length; cursor++) {
+        const cursorChar = text[cursor];
+        if (payloadInString) {
+          if (payloadEscaped) payloadEscaped = false;
+          else if (cursorChar === "\\") payloadEscaped = true;
+          else if (cursorChar === '"') payloadInString = false;
+        } else if (cursorChar === '"') {
+          payloadInString = true;
+        } else if (text.startsWith(TOOL_CALL_CLOSE, cursor)) {
+          envelopes.push(text.slice(start, cursor).trim());
+          index = cursor + TOOL_CALL_CLOSE.length - 1;
+          closed = true;
+          break;
+        }
+      }
+      if (!closed) return incomplete();
+      continue;
+    }
+    // A bare tag name embedded in explanatory prose is not a request.
+    // Invocation payloads, paired tags, isolated markers and mixed calls are.
+    const afterTag = markerText.slice(tag.lastIndex);
+    const invocationLike = sawPiMarker || !markerText.slice(0, index).trim() || !afterTag.trim() ||
+      /^\s*[\[{<]/.test(afterTag) || marker[0].startsWith("</") || /\s[\w:.-]+=/.test(marker[0]);
+    if (FOREIGN_TOOL_TAG_RE.test(name) && invocationLike) {
+      return fail(new ProviderProtocolError(
+        "UNKNOWN_TOOL_LIKE_FORMAT",
+        `Unrecognized tool-call tag ${marker[0]}; the only accepted envelope is <pi_tool_call>...</pi_tool_call>`,
+      ));
+    }
+    index = tag.lastIndex - 1;
   }
-  return envelopes.length ? { envelopes } : incomplete();
+  // No markers at all is neutral, not an error — the caller classifies.
+  return { envelopes, sawPiMarker };
 }
 
 // --- Up-front input-shape classifier ---
@@ -494,9 +574,13 @@ function classifyParsedJson(value: unknown): ProviderPayloadShape {
 }
 
 /** Internal classify that also returns the already-parsed JSON value. */
-function classifyString(input: string): { shape: ProviderPayloadShape; parsed?: unknown } {
-  // Qoder marker recognition has priority over malformed-JSON detection.
-  if (/<\/?pi_tool_call\b/i.test(maskCodeLiteralToolMarkers(input))) return { shape: "QODER_TOOL" };
+function classifyString(input: string): { shape: ProviderPayloadShape; parsed?: unknown; error?: ProviderProtocolError } {
+  // Marker recognition (contract tag AND foreign tool-call tags) has
+  // priority over malformed-JSON detection. The scan is JSON-string aware,
+  // so tags inside string values of JSON-looking fragments stay data.
+  const scanned = scanToolCallEnvelopes(input);
+  if (scanned.error?.code === "UNKNOWN_TOOL_LIKE_FORMAT") return { shape: "MALFORMED_TOOL_LIKE", error: scanned.error };
+  if (scanned.error || scanned.sawPiMarker) return { shape: "QODER_TOOL" };
   const trimmed = input.trim();
   if (!trimmed) return { shape: "PLAIN_TEXT" };
   try {
@@ -651,6 +735,9 @@ function normalizeQoderEnvelopeText(
   const fail = (error: ProviderProtocolError): ProtocolErrorResponse => ({ kind: "protocol_error", error });
   const scanned = scanToolCallEnvelopes(text);
   if (scanned.error) return fail(scanned.error);
+  if (!scanned.envelopes.length) {
+    return fail(new ProviderProtocolError("UNCLOSED_ENVELOPE", "pi_tool_call marker found without a complete envelope"));
+  }
   try {
     return scanned.envelopes.map((raw, index) => {
       instrument?.("parse_input", raw, index + 1);
@@ -724,13 +811,13 @@ export function normalizeProviderResponse(input: string | StructuredProviderPayl
     return { kind: "tool_calls", calls: validated, parser: "native_tool_use" };
   }
 
-  const { shape, parsed } = classifyString(input);
+  const { shape, parsed, error } = classifyString(input);
   if (shape === "PLAIN_TEXT") {
     instrument?.("parse_input", input, 0);
     return { kind: "text", text: input };
   }
   if (shape === "MALFORMED_TOOL_LIKE") {
-    return fail(new ProviderProtocolError("UNKNOWN_TOOL_LIKE_FORMAT", "Unrecognized tool-call payload shape; refusing to repair or treat as text"));
+    return fail(error ?? new ProviderProtocolError("UNKNOWN_TOOL_LIKE_FORMAT", "Unrecognized tool-call payload shape; refusing to repair or treat as text"));
   }
   if (shape === "QODER_TOOL") {
     instrument?.("parser_selected", "qoder_envelope", 0);
@@ -801,10 +888,20 @@ export function bridgeSystemPrompt(context: TranscriptContext): string {
   return `${getCurrentSystemPrompt(context.messages)}\n\n` +
     `QODER-PI BRIDGE CONTRACT\n` +
     `You are the model backend inside Pi. Qoder runtime tools are disabled. Pi owns all tool execution and approval.\n` +
-    `When a tool is needed, output only one or more exact envelopes, with no prose or Markdown:\n` +
+    `Any earlier "do not print tool-call syntax" instruction bans pseudo calls that only imitate a call in prose; the exact envelope below is different — it is Pi's real tool invocation path and must be printed verbatim when a tool is needed.\n` +
+    `When a tool is needed, output only envelopes, with no prose or Markdown:\n` +
     `<pi_tool_call>{"name":"tool_name","arguments":{}}</pi_tool_call>\n` +
-    `Use only listed tools. Arguments must satisfy JSON Schema. After Pi returns tool results, continue from transcript.\n` +
-    `When no tool is needed, answer normally and never emit the envelope.\n` +
+    `The opening tag is exactly <pi_tool_call> and the closing tag is exactly </pi_tool_call>. Renamed or numbered tags (e.g. <tool_call_1> or <pi_tool_call_2>) are not accepted and are never executed.\n` +
+    `One envelope carries exactly one JSON object with "name" and "arguments". For multiple calls emit multiple separate envelopes.\n` +
+    `When the user requests multiple independent calls in the same response or turn, emit all their envelopes in that same assistant message, in the requested order; do not stop after one call or wait for its result to split the batch. Calls whose arguments genuinely depend on an earlier result must instead wait for that result; never invent dependent arguments.\n` +
+    `If the user specifies sequential calls with a result wait between steps, wait for each authoritative tool_result before emitting the next step, even when all arguments are already known; do not combine those steps in one assistant message.\n` +
+    `Use only listed tools: replace the placeholder "tool_name" with a listed tool, never emit it as-is. Arguments must satisfy JSON Schema.\n` +
+    `After Pi returns tool results, continue from transcript. When no tool is needed, answer normally and never emit the envelope.\n` +
+    `Track the requested operations already completed in the transcript. Once every required operation has its authoritative tool_result, give the final answer instead of replaying the task. Do not repeat a completed call merely to refresh or verify it unless the user's task explicitly requires that repetition.\n` +
+    `A tool_result with isError=true is the actual outcome of that call, not a reason to abandon the remaining requested operations. If required operations remain, emit the real envelopes for them — never a final message that only says you will run them.\n` +
+    `Any marker or token that a task asks you to print in the final answer (e.g. a completion marker) is printed output only, not a search target, unless the user explicitly asks you to search for it.\n` +
+    `Copy requested exact final text, markers, and tokens verbatim, preserving capitalization. If a standalone final line is requested, separate it from the preceding body with a newline, make it the final line, and do not append it to JSON or add quotes, Markdown decoration, or extra text.\n` +
+    `Report error codes by copying them verbatim from the authoritative tool_result; preserve their spelling and capitalization rather than paraphrasing or guessing the code.\n` +
     `PI_TOOLS=${JSON.stringify(tools)}`;
 }
 
@@ -872,6 +969,14 @@ export interface QoderBridgeStreamExtras {
   onDiagnostic?: (event: QoderBridgeDiagnosticEvent) => void;
   /** Enable redacted Bridge diagnostics and observation of SDK stream_event deltas. */
   debug?: boolean;
+  /**
+   * Receives bounded, redacted warnings the SDK emits alongside a turn
+   * (currently agents_md_size_warning). Independent of debug/onDiagnostic so
+   * callers can observe warnings without enabling full payload logs. Callback
+   * failures are swallowed and never change the provider outcome. Warnings
+   * contain structural metadata only — never model text or file contents.
+   */
+  onWarning?: (warning: QoderBridgeWarning) => void;
 }
 
 /** Stable diagnostic event shape consumed by the live harness (jsonl per turn). */
@@ -881,6 +986,22 @@ export interface QoderBridgeDiagnosticEvent {
   sequence: number;
   elapsedMs: number;
   payload: unknown;
+}
+
+/**
+ * Bounded, sanitized warning surfaced through QoderBridgeStreamExtras.onWarning.
+ * kind is the machine-readable SDK signal name. No model output, tool
+ * execution, file contents, or arbitrary SDK fields are carried — only the
+ * declared structural fields.
+ */
+export interface QoderBridgeWarning {
+  kind: "agents_md_size_warning";
+  code?: string;
+  severity?: string;
+  total_bytes?: number;
+  threshold_bytes?: number;
+  load_status?: string;
+  file_count?: number;
 }
 
 /** Timeout classification labels surfaced in errorMessage (prefix before `:`). */
@@ -895,24 +1016,44 @@ export const PROVIDER_TIMEOUT_KIND = {
   CONTINUATION: "POST_TOOL_CONTINUATION_TIMEOUT",
 } as const;
 
+/**
+ * Stable error codes for known SDK 1.0.51 failure classes. They are
+ * classification labels only: retry safety is NOT claimed — SDK ControlRequestError
+ * carries its own `retryable` flag which the bridge forwards when the runtime
+ * supplies it — and no automatic retry is ever performed.
+ */
+export const SDK_ERROR_CODE = {
+  /** Wire-protocol major mismatch between the announced qodercli and this SDK build. */
+  PROTOCOL_VERSION_MISMATCH: "SDK_PROTOCOL_VERSION_MISMATCH",
+  /** The running qodercli does not advertise a capability the SDK requires. */
+  UNSUPPORTED_CLI_CAPABILITY: "SDK_UNSUPPORTED_CLI_CAPABILITY",
+  /** An outbound SDK control request exceeded its local timeout window. */
+  CONTROL_REQUEST_TIMEOUT: "SDK_CONTROL_REQUEST_TIMEOUT",
+  /** The runtime rejected an SDK control request with another runtime code. */
+  CONTROL_REQUEST_REJECTED: "SDK_CONTROL_REQUEST_REJECTED",
+  /** The resolveModel callback did not return within resolveModelTimeoutMs. */
+  MODEL_POLICY_TIMEOUT: "SDK_MODEL_POLICY_TIMEOUT",
+  /** Terminal result reports agent termination via a hook (terminal_reason=hook_stopped). */
+  HOOK_STOPPED: "SDK_HOOK_STOPPED",
+  /** Terminal result carried a non-success subtype or is_error. */
+  TERMINAL_ERROR: "SDK_TERMINAL_ERROR",
+} as const;
+
 const DEFAULT_POST_TOOL_CONTINUATION_TIMEOUT_MS = 15_000;
 const DEFAULT_PROVIDER_MESSAGE_TIMEOUT_MS = 120_000;
 const DEFAULT_PROVIDER_QUEUE_TIMEOUT_MS = 120_000;
-const DEFAULT_TOTAL_DEADLINE_MS = 300_000;
+// Finite absolute per-call bound, independent of queue heartbeats. Congested
+// model queues (e.g. Qwen) can legitimately sit silent between SDK status
+// polls for longer than the ordinary silence bounds, so the default tolerates
+// a long queue while never becoming an infinite wait. An explicit
+// options.totalDeadlineMs always overrides this.
+export const DEFAULT_TOTAL_DEADLINE_MS = 900_000;
 const CLOSE_TIMEOUT_MS = 5_000;
 
 const SECRET_KEY_RE = /api[_-]?key|token|secret|password|authorization|credential/i;
 
 function redactValue(value: unknown, extraSecrets: readonly string[], keyPath = ""): unknown {
-  if (typeof value === "string") {
-    let out = value;
-    for (const secret of extraSecrets) {
-      if (secret && out.includes(secret)) out = out.split(secret).join("<redacted>");
-    }
-    if (SECRET_KEY_RE.test(keyPath)) return "<redacted>";
-    return out.replace(/Bearer\s+\S+/gi, "Bearer <redacted>")
-      .replace(/((?:api[_-]?key|token|secret|password|authorization)\s*["']?\s*[:=]\s*["']?)[^"'\s,}]+/gi, "$1<redacted>");
-  }
+  if (typeof value === "string") return redactString(value, extraSecrets, keyPath);
   if (Array.isArray(value)) return value.map((entry) => redactValue(entry, extraSecrets, keyPath));
   if (value && typeof value === "object") {
     const out: Record<string, unknown> = {};
@@ -920,6 +1061,43 @@ function redactValue(value: unknown, extraSecrets: readonly string[], keyPath = 
     return out;
   }
   return value;
+}
+
+/** String-level redaction shared by diagnostics and surfaced errorMessage. */
+function redactString(text: string, extraSecrets: readonly string[], keyPath = ""): string {
+  let out = text;
+  for (const secret of extraSecrets) {
+    if (secret && out.includes(secret)) out = out.split(secret).join("<redacted>");
+  }
+  if (SECRET_KEY_RE.test(keyPath)) return "<redacted>";
+  return out.replace(/Bearer\s+\S+/gi, "Bearer <redacted>")
+    .replace(/((?:api[_-]?key|token|secret|password|authorization)\s*["']?\s*[:=]\s*["']?)[^"'\s,}]+/gi, "$1<redacted>");
+}
+
+/** Result fields that are safe to surface verbatim: numbers and short tokens
+ *  (error_code, terminal_reason). Longer/free-form strings stay redacted
+ *  because the SDK does not bound what they may contain. */
+function resultToken(value: unknown): string | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  if (typeof value === "string" && /^[A-Za-z0-9_.:-]{1,64}$/.test(value)) return value;
+  return undefined;
+}
+
+/** Structured failure classification for SDK errors thrown from query().
+ *  The returned code is stable and safe to compare; `retryable` is forwarded
+ *  verbatim from the SDK's own flag — the bridge never retries on its own.
+ *  details is never forwarded (it may carry runtime internals/credentials). */
+function classifySdkError(error: Error): { code: string; retryable?: boolean } {
+  if (error instanceof ControlRequestError) {
+    return {
+      code: error.code === CONTROL_REQUEST_TIMEOUT_CODE ? SDK_ERROR_CODE.CONTROL_REQUEST_TIMEOUT : SDK_ERROR_CODE.CONTROL_REQUEST_REJECTED,
+      retryable: error.retryable,
+    };
+  }
+  if (error instanceof ProtocolVersionMismatchError) return { code: SDK_ERROR_CODE.PROTOCOL_VERSION_MISMATCH };
+  if (error instanceof UnsupportedCliCapabilityError) return { code: SDK_ERROR_CODE.UNSUPPORTED_CLI_CAPABILITY };
+  if (error instanceof ModelPolicyTimeoutError) return { code: SDK_ERROR_CODE.MODEL_POLICY_TIMEOUT };
+  return { code: "SDK_ERROR" };
 }
 
 function debugEnabled(options?: SimpleStreamOptions & QoderBridgeStreamExtras): boolean {
@@ -993,6 +1171,14 @@ export function streamQoder(
     };
     try { internals.onDiagnostic?.(event); } catch { /* sink must never break the stream */ }
     try { options?.onDiagnostic?.(event); } catch { /* sink must never break the stream */ }
+  };
+  // Warning sink is independent of debug: bounded structural metadata only,
+  // delivered to options.onWarning regardless of payload-log settings. A
+  // throwing callback must never change the provider outcome.
+  const emitWarning = (warning: QoderBridgeWarning) => {
+    const safe = redactValue(warning, secrets) as QoderBridgeWarning;
+    emitDiagnostic("sdk_warning", safe);
+    try { options?.onWarning?.(safe); } catch { /* warning sink must never break the stream */ }
   };
   let state: BridgeState = BRIDGE_STATE.WAITING_PROVIDER;
   const terminal = () => state === BRIDGE_STATE.COMPLETED || state === BRIDGE_STATE.FAILED;
@@ -1109,7 +1295,14 @@ export function streamQoder(
       const resolvedKey = options?.apiKey;
       const auth = resolvedKey && resolvedKey !== LOCAL_AUTH ? accessToken(resolvedKey) : qodercliAuth();
       const makeQuery = internals.queryFactory ?? ((params: Parameters<typeof query>[0]) => query(params) as unknown as QueryLike);
-      const history = JSON.parse(serializeContext(context));
+      // System-role entries are deliberately excluded from the serialized
+      // history handed to query(): the current system prompt is supplied
+      // once via options.systemPrompt (bridgeSystemPrompt), so re-sending it
+      // inside PI_CONVERSATION_JSON would duplicate the instruction. The
+      // public serializeContext() contract is unchanged — this filter only
+      // applies to the query-bound history. user/assistant/tool_result
+      // content, order, ids and isError are preserved as-is.
+      const history = (JSON.parse(serializeContext(context)) as Array<{ role?: string }>).filter((entry) => entry.role !== "system");
       const systemPrompt = bridgeSystemPrompt(context);
       debug(continuation ? "continuation_request" : "provider_request", {
         prompt: { PI_CONVERSATION_JSON: history },
@@ -1169,10 +1362,11 @@ export function streamQoder(
       // silence is classified separately from initial-provider timeout.
       while (!sawTerminal) {
         if (externalAborted()) throw Object.assign(new Error("Qoder stream aborted"), { name: "AbortError" });
-        if (remaining() <= 0) throw timeoutError(`total deadline ${totalDeadlineMs}ms`);
+        if (remaining() <= 0) throw timeoutError(`total deadline ${totalDeadlineMs}ms reached (elapsed ${elapsedMs()}ms)`);
         let settled: IteratorResult<SDKMessage> | undefined;
         const nextPromise = iterator.next().then((r) => { settled = r; return r; });
         const bound = perMessageBound();
+        const deadlineLimited = bound >= remaining();
         let timeout: ReturnType<typeof setTimeout> | undefined;
         let raced: "next" | "timeout";
         try {
@@ -1183,7 +1377,9 @@ export function streamQoder(
           ]);
         } finally { clearTimeout(timeout); }
         if (raced === "timeout") {
-          throw timeoutError(`no provider message for ${bound}ms`);
+          throw timeoutError(deadlineLimited
+            ? `total deadline ${totalDeadlineMs}ms reached (elapsed ${elapsedMs()}ms)`
+            : `no provider message for ${bound}ms`);
         }
         if (settled?.done) break;
         const message = settled?.value;
@@ -1232,6 +1428,21 @@ export function streamQoder(
         if (message.type === "command_lifecycle" && (message as { state?: string }).state === "started") {
           if (!sawHandoffAck) { sawHandoffAck = true; handoffAckMs = elapsedMs(); emitDiagnostic("handoff_ack", { state: "started", handoffAckMs }); }
         }
+        // SDK 1.0.51: bounded, sanitized warning — structural metadata only.
+        // File contents, arbitrary event fields and secrets are never copied;
+        // only the declared numeric/status fields plus a file count.
+        if (message.type === "system" && (message as { subtype?: string }).subtype === "agents_md_size_warning") {
+          const warning = message as SDKAgentsMdSizeWarningMessage;
+          emitWarning({
+            kind: "agents_md_size_warning",
+            code: resultToken(warning.code),
+            severity: resultToken(warning.severity),
+            total_bytes: typeof warning.total_bytes === "number" ? warning.total_bytes : undefined,
+            threshold_bytes: typeof warning.threshold_bytes === "number" ? warning.threshold_bytes : undefined,
+            load_status: resultToken(warning.load_status),
+            file_count: Array.isArray(warning.files) ? warning.files.length : undefined,
+          });
+        }
         if (messageUuid) {
           const previous = seenUuids.get(messageUuid);
           if (previous !== undefined) {
@@ -1265,7 +1476,7 @@ export function streamQoder(
           });
         } else if (message.type === "assistant") {
           if (!sawFirstModelEvent) { sawFirstModelEvent = true; firstModelEventMs = elapsedMs(); }
-          if (message.error) throw new Error(`Qoder model error: ${message.error}`);
+          if (message.error) throw new Error(redactString(`Qoder model error: ${message.error}`, secrets));
           if (message.message?.role !== "assistant" || message.message?.type !== "message" || !Array.isArray(message.message.content)) {
             throw new ProviderProtocolError("INVALID_ASSISTANT_MESSAGE", "Invalid SDK assistant role/type/content");
           }
@@ -1356,16 +1567,42 @@ export function streamQoder(
             num_turns: message.num_turns,
             usage: message.usage,
           });
-          if (message.subtype !== "success" || message.is_error) throw new Error(("errors" in message ? message.errors?.join("; ") : "") || message.subtype);
+          // error_code is diagnostic metadata, not a documented success/failure
+          // predicate. Preserve subtype/is_error authority, including unfamiliar
+          // codes on otherwise-successful results, without guessing meanings.
+          const resultErrorCode = resultToken(message.error_code);
+          emitDiagnostic("sdk_terminal_metadata", {
+            subtype: message.subtype,
+            is_error: message.is_error,
+            error_code: typeof message.error_code === "number" && Number.isFinite(message.error_code)
+              ? message.error_code : resultErrorCode ?? null,
+            terminal_reason: resultToken(message.terminal_reason) ?? null,
+          });
+          if (message.subtype !== "success" || message.is_error) {
+            const errors = "errors" in message ? message.errors : undefined;
+            const detail = errors?.length
+              ? redactString(errors.join("; "), secrets)
+              : String(message.subtype);
+            throw new ProviderProtocolError(
+              SDK_ERROR_CODE.TERMINAL_ERROR,
+              `${SDK_ERROR_CODE.TERMINAL_ERROR}: ${detail || "terminal result error"}` +
+                `${resultErrorCode !== undefined ? ` [error_code=${resultErrorCode}]` : ""}` +
+                `${resultToken(message.terminal_reason) !== undefined ? ` [terminal_reason=${resultToken(message.terminal_reason)}]` : ""}`,
+            );
+          }
           const resultText = "result" in message && typeof message.result === "string" ? message.result : "";
           // result.result is an echo of assistant output, never an additional
           // chunk — it may only fill in when no assistant snapshot arrived.
+          // error_code/terminal_reason are recorded verbatim as diagnostics —
+          // their meaning is explained, never guessed from the numeric value.
           emitDiagnostic("sdk_terminal_result", {
             seq: rawSeq,
             uuid: messageUuid,
             resultText,
             resultDigest: digestOf(resultText),
             echoesAssembled: resultText === assembled.text,
+            error_code: resultErrorCode ?? null,
+            terminal_reason: resultToken(message.terminal_reason) ?? null,
           });
           if (!nativeToolCalls && !assembled.text) assembled.text = clean(resultText);
         }
@@ -1444,15 +1681,47 @@ export function streamQoder(
         throw normalized.error;
       }
 
+      // terminal_reason records why the AGENT terminated the turn; it is
+      // independent of the model stop_reason. Documented values only:
+      // hook_stopped means a Hook ended the turn even when stop_reason says
+      // tool_use — releasing tool calls then would execute work a hook
+      // already stopped, so fail closed instead. Unknown/absent reasons stay
+      // compatible (diagnostic only); they are never invented into errors.
+      const terminalReason = resultToken(result.terminal_reason);
+      if (terminalReason === "hook_stopped") {
+        if (normalized.kind === "tool_calls") {
+          throw new ProviderProtocolError(
+            SDK_ERROR_CODE.HOOK_STOPPED,
+            `${SDK_ERROR_CODE.HOOK_STOPPED}: a hook stopped the agent turn; pending tool calls are not released to Pi (stop_reason=${JSON.stringify(result.stop_reason)}, error_code=${resultToken(result.error_code) ?? "none"})`,
+          );
+        }
+        emitDiagnostic("hook_stopped_result", {
+          terminal_reason: terminalReason,
+          stop_reason: result.stop_reason,
+          error_code: resultToken(result.error_code) ?? null,
+        });
+      } else if (terminalReason !== undefined) {
+        emitDiagnostic("terminal_reason_observed", {
+          terminal_reason: terminalReason,
+          stop_reason: result.stop_reason,
+          error_code: resultToken(result.error_code) ?? null,
+        });
+      }
+
       // Stop-reason contradiction: the model emitted envelope tool calls while
       // the SDK-level stop_reason says the turn ended for another reason, or
       // vice versa the stop reason demands tool use but none were emitted.
+      // hook_stopped is exempt: the hook — not the model stop reason — ended
+      // the turn, so stop_reason/tool_use mismatches are expected, never a
+      // contradiction, and any pending calls were already refused above.
       const sdkStop = result.stop_reason;
-      if (normalized.kind === "tool_calls" && sdkStop && sdkStop !== "tool_use" && sdkStop !== "end_turn" && sdkStop !== "stop_sequence") {
-        throw new ProviderProtocolError("STOP_REASON_CONTRADICTION", `tool envelopes emitted but SDK stop_reason is ${JSON.stringify(sdkStop)}`);
-      }
-      if (normalized.kind === "text" && sdkStop === "tool_use") {
-        throw new ProviderProtocolError("STOP_REASON_CONTRADICTION", "SDK stop_reason is tool_use but no envelope was emitted");
+      if (terminalReason !== "hook_stopped") {
+        if (normalized.kind === "tool_calls" && sdkStop && sdkStop !== "tool_use" && sdkStop !== "end_turn" && sdkStop !== "stop_sequence") {
+          throw new ProviderProtocolError("STOP_REASON_CONTRADICTION", `tool envelopes emitted but SDK stop_reason is ${JSON.stringify(sdkStop)}`);
+        }
+        if (normalized.kind === "text" && sdkStop === "tool_use") {
+          throw new ProviderProtocolError("STOP_REASON_CONTRADICTION", "SDK stop_reason is tool_use but no envelope was emitted");
+        }
       }
 
       if (normalized.kind === "tool_calls") {
@@ -1484,6 +1753,12 @@ export function streamQoder(
       emitDiagnostic("handoff", {
         stopReason: output.stopReason,
         rawStopReason: result.stop_reason,
+        // Terminal metadata preserved verbatim for diagnostics: error_code is
+        // the SDK's own result code (0 is informational, not a failure) and
+        // terminal_reason is the agent-termination signal, independent of the
+        // model's stop_reason.
+        terminal_reason: resultToken(result.terminal_reason) ?? null,
+        error_code: resultToken(result.error_code) ?? null,
         firstMessageMs,
         firstModelEventMs,
         handoffAckMs,
@@ -1497,9 +1772,32 @@ export function streamQoder(
       if (output.stopReason !== "toolUse") setState(BRIDGE_STATE.COMPLETED);
       stream.end();
     } catch (error) {
+      // Explicit abort classification is preserved first — SDK AbortError and
+      // bridge AbortError both keep name "AbortError" and abort wins over
+      // every SDK failure class.
       const isAbort = controller.signal.aborted || (error instanceof Error && error.name === "AbortError");
       output.stopReason = isAbort ? "aborted" : "error";
       output.errorMessage = error instanceof Error ? error.message : String(error);
+      if (!isAbort && error instanceof Error) {
+        // Structured SDK failure classification. Codes are stable for callers
+        // to compare; `retryable` is the SDK's own guarantee, forwarded but
+        // never acted on (no auto-retry). error.details is never surfaced —
+        // it may carry runtime internals or credential material.
+        const classified = classifySdkError(error);
+        if (classified.code !== "SDK_ERROR") {
+          emitDiagnostic("sdk_error_classification", {
+            code: classified.code,
+            retryable: classified.retryable ?? false,
+            errorName: error.name,
+            ...(error instanceof ControlRequestError ? { requestId: error.requestId, controlCode: error.code ?? null } : {}),
+          });
+          output.errorMessage = `${classified.code}: ${error.message}` +
+            (classified.retryable === true ? " [sdk-reported-retryable]" : "");
+        }
+      }
+      // Surface secrets never reach errorMessage: the supplied apiKey,
+      // Bearer/token-shaped values and inline secret assignments are redacted.
+      output.errorMessage = redactString(output.errorMessage, secrets);
       await closeQuery();
       stream.push({ type: "error", reason: output.stopReason, error: output });
       setState(BRIDGE_STATE.FAILED);
@@ -1609,15 +1907,35 @@ export default function qoderBridgeExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("qoder-bridge-status", {
-    description: "Show Qoder CLI version and local login availability",
+    description: "Show installed SDK version, qodercli availability and local login status",
     handler: async (_args, ctx) => {
+      // SDK version is read from the installed package metadata — no SDK
+      // Worker, qodercli process or runtime is launched to obtain it, so the
+      // status works even when no CLI is installed.
+      const sdkVersion = installedQoderSdkVersion();
+      const cliLogin = hasQoderLogin() ? "found" : "not found";
+      // "Reuse Qoder CLI login" pairs the SDK Worker with the CLI's saved
+      // credential file. A CLI login existing on disk is NOT proof that the
+      // SDK Worker runtime is installed or paired; it only means an
+      // independent `qoder login` completed at some point.
+      const pairing = "SDK Worker installation is separate from CLI login status: the SDK postinstall downloads its matching Worker runtime; CLI login does not verify Worker availability.";
       const command = qoderCliCommand();
       if (!command) {
-        ctx.ui.notify("Qoder CLI is not on PATH. Run /qoder-bridge-setup for installation guidance.", "warning");
+        ctx.ui.notify(
+          `Qoder Agent SDK: ${sdkVersion} (installed; capabilities for versions other than 1.0.32 remain UNVERIFIED until audited)\n` +
+          `qodercli: not found on PATH\nLocal CLI login file: ${cliLogin}\n${pairing}\n` +
+          "Run /qoder-bridge-setup for installation guidance.",
+          "warning",
+        );
         return;
       }
       const result = await pi.exec(command, ["--version"], { timeout: 15_000 });
-      ctx.ui.notify(`${(result.stdout || result.stderr || "No output").trim()}\nLocal login: ${hasQoderLogin() ? "found" : "not found"}`, result.code === 0 ? "info" : "warning");
+      ctx.ui.notify(
+        `Qoder Agent SDK: ${sdkVersion} (capabilities for versions other than 1.0.32 remain UNVERIFIED until audited)\n` +
+        `${(result.stdout || result.stderr || "No output").trim()}\n` +
+        `Local CLI login file: ${cliLogin}\n${pairing}`,
+        result.code === 0 ? "info" : "warning",
+      );
     },
   });
 }

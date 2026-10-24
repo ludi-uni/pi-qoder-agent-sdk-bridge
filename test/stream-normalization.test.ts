@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   __setBridgeInternals,
+  bridgeSystemPrompt,
   normalizeProviderResponse,
   isContinuationContext,
   validateContinuation,
@@ -650,4 +651,146 @@ test("invalid continuation context → immediate protocol error", async () => {
   } finally {
     __setBridgeInternals({});
   }
+});
+
+// --- query-bound history: system entries move to options.systemPrompt ---
+
+function capturedParams(): { captured: Record<string, unknown>[]; factory: (params: Record<string, unknown>) => FakeQuery } {
+  const captured: Record<string, unknown>[] = [];
+  return {
+    captured,
+    factory: (params) => {
+      captured.push(params);
+      return makeFakeQuery([assistantText("ok"), resultMessage()]);
+    },
+  };
+}
+
+test("streamQoder sends system instructions via options.systemPrompt, not in PI_CONVERSATION_JSON", async () => {
+  const { captured, factory } = capturedParams();
+  __setBridgeInternals({ queryFactory: factory as never });
+  try {
+    const { final } = await collect(streamQoder(MODEL, BASE_CTX, FAST));
+    assert.equal(final.stopReason, "stop");
+    assert.equal(captured.length, 1);
+    const params = captured[0];
+    const options = params.options as Record<string, unknown>;
+    assert.equal(typeof options.systemPrompt, "string");
+    const systemPrompt = options.systemPrompt as string;
+    assert.match(systemPrompt, /sys/);
+    assert.match(systemPrompt, /QODER-PI BRIDGE CONTRACT/);
+    assert.match(systemPrompt, /PI_TOOLS=/);
+    // The query prompt must carry no duplicated system-role entries.
+    const prompt = params.prompt as string;
+    assert.ok(prompt.startsWith("PI_CONVERSATION_JSON="));
+    const history = JSON.parse(prompt.slice("PI_CONVERSATION_JSON=".length)) as Array<Record<string, unknown>>;
+    assert.equal(history.some((entry) => entry.role === "system"), false);
+    assert.deepEqual(history.map((entry) => entry.role), ["user"]);
+    assert.equal(history[0].content, "hi");
+  } finally {
+    __setBridgeInternals({});
+  }
+});
+
+test("streamQoder query history keeps tool_result isError/id/order and drops only system entries", async () => {
+  const errResult: Message = {
+    role: "toolResult",
+    toolCallId: "c1",
+    toolName: "read",
+    isError: true,
+    content: [{ type: "text", text: "ENOENT: no such file" }],
+    timestamp: 1,
+  };
+  const messages: Message[] = [
+    user("go"),
+    assistantMsg([
+      { id: "c1", name: "read", arguments: { path: "missing" } },
+      { id: "c2", name: "ls", arguments: { path: "." } },
+    ]),
+    errResult,
+    toolRes("c2", "ls", "out"),
+  ];
+  const { captured, factory } = capturedParams();
+  __setBridgeInternals({ queryFactory: factory as never });
+  try {
+    const { final } = await collect(streamQoder(MODEL, ctx(messages), FAST));
+    assert.equal(final.stopReason, "stop");
+    assert.equal(captured.length, 1);
+    const params = captured[0];
+    const history = JSON.parse((params.prompt as string).slice("PI_CONVERSATION_JSON=".length)) as Array<Record<string, unknown>>;
+    assert.deepEqual(history.map((entry) => entry.role), ["user", "assistant", "tool_result", "tool_result"]);
+    // Assistant tool calls keep id/name/arguments and order.
+    const assistant = history[1];
+    const calls = (assistant.content as Array<Record<string, unknown>>).filter((block) => block.type === "tool_call");
+    assert.deepEqual(calls.map((call) => call.id), ["c1", "c2"]);
+    assert.deepEqual(calls.map((call) => call.name), ["read", "ls"]);
+    // Tool results keep toolCallId, toolName, isError and order — including isError=true.
+    const first = history[2];
+    assert.equal(first.role, "tool_result");
+    assert.equal(first.toolCallId, "c1");
+    assert.equal(first.toolName, "read");
+    assert.equal(first.isError, true);
+    assert.match(first.content as string, /ENOENT/);
+    const second = history[3];
+    assert.equal(second.toolCallId, "c2");
+    assert.equal(second.isError, false);
+    // The system prompt still carries the agent system instructions plus the bridge contract.
+    const systemPrompt = (params.options as Record<string, unknown>).systemPrompt as string;
+    assert.match(systemPrompt, /sys/);
+    assert.match(systemPrompt, /PI_TOOLS=/);
+  } finally {
+    __setBridgeInternals({});
+  }
+});
+
+test("bridgeSystemPrompt states the continuation contract for tool_result.isError and final markers", () => {
+  const prompt = bridgeSystemPrompt(ctx([user("hi")]));
+  assert.match(prompt, /isError=true/);
+  assert.match(prompt, /actual outcome/);
+  assert.match(prompt, /remaining requested operations/);
+  assert.match(prompt, /printed output only|not a search target/i);
+  // The existing contract lines are preserved.
+  assert.match(prompt, /QODER-PI BRIDGE CONTRACT/);
+  assert.match(prompt, /<pi_tool_call>\{"name":"tool_name","arguments":\{\}\}<\/pi_tool_call>/);
+  // Existing agent system instructions are retained, not dropped.
+  assert.match(prompt, /sys/);
+});
+
+test("bridgeSystemPrompt preserves requested batching without inventing result-dependent arguments", () => {
+  const prompt = bridgeSystemPrompt(ctx([user("hi")]));
+  assert.match(prompt, /multiple independent calls in the same response or turn/);
+  assert.match(prompt, /all their envelopes in that same assistant message/);
+  assert.match(prompt, /requested order/);
+  assert.match(prompt, /genuinely depend on an earlier result must instead wait/);
+  assert.match(prompt, /never invent dependent arguments/);
+});
+
+test("bridgeSystemPrompt honors explicit result waits even for known arguments and stops after completed operations", () => {
+  const prompt = bridgeSystemPrompt(ctx([user("hi")]));
+  assert.match(prompt, /sequential calls with a result wait between steps/);
+  assert.match(prompt, /even when all arguments are already known/);
+  assert.match(prompt, /do not combine those steps/);
+  assert.match(prompt, /every required operation has its authoritative tool_result/);
+  assert.match(prompt, /give the final answer instead of replaying the task/);
+  assert.match(prompt, /unless the user's task explicitly requires that repetition/);
+});
+
+test("bridgeSystemPrompt requires exact final lines and verbatim observed error codes", () => {
+  const prompt = bridgeSystemPrompt(ctx([user("hi")]));
+  assert.match(prompt, /markers, and tokens verbatim, preserving capitalization/);
+  assert.match(prompt, /standalone final line/);
+  assert.match(prompt, /separate it from the preceding body with a newline/);
+  assert.match(prompt, /do not append it to JSON or add quotes, Markdown decoration/);
+  assert.match(prompt, /error codes by copying them verbatim from the authoritative tool_result/);
+  assert.match(prompt, /rather than paraphrasing or guessing the code/);
+});
+
+test("bridgeSystemPrompt keeps prior system message content (existing agent instructions preserved)", () => {
+  const prompt = bridgeSystemPrompt(normalizeContext({
+    systemPrompt: "AGENT_RULES_V1",
+    tools: TOOLS,
+    messages: [{ role: "system", content: "MID_CONVO_UPDATE", timestamp: 1 } as Message, user("hi")],
+  }));
+  assert.match(prompt, /AGENT_RULES_V1/);
+  assert.match(prompt, /MID_CONVO_UPDATE/);
 });

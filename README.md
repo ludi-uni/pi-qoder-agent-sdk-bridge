@@ -2,16 +2,16 @@
 
 Use Qoder models in [Pi](https://pi.dev/) through the **official Qoder Agent SDK**. Independent community extension; not affiliated with Qoder or Pi.
 
-> **Release status:** 0.2.2 prepared for npm publication; this version has not been published by this release preparation. `pi-qoder-bridge` is owned by another project, so this package uses the distinct name `pi-qoder-agent-sdk-bridge`.
+> **Release status:** this checkout is version 0.4.0 (see `package.json`). Its npm publication status is not asserted here; confirm the version is actually published before using the npm install command below. `pi-qoder-bridge` is owned by another project, so this package uses the distinct name `pi-qoder-agent-sdk-bridge`.
 
 [日本語の導入ガイド](docs/ja/quickstart.md) · [Qoder SDK](https://docs.qoder.com/cli/sdk/overview) · [Third-party terms](THIRD_PARTY_NOTICES.md)
 
-## Install (after npm publication)
+## Install (after the corresponding version is published to npm)
 
-Requirements: Node.js 20+, Pi, and a Qoder account with either a Personal Access Token (PAT) or a signed-in Qoder CLI. Your package manager must allow the Qoder SDK postinstall script to fetch its Worker runtime.
+Requirements: Node.js >= 22.23.4 (per `engines` in `package.json`), Pi, and a Qoder account with either a Personal Access Token (PAT) or a signed-in Qoder CLI. Your package manager must allow the Qoder SDK postinstall script to fetch its Worker runtime. Verify that the version you want is actually published on npm before running the command — this checkout's version, 0.4.0, is not asserted to be published.
 
 ```sh
-pi install npm:pi-qoder-agent-sdk-bridge@0.2.2
+pi install npm:pi-qoder-agent-sdk-bridge@0.4.0
 pi list
 ```
 
@@ -19,7 +19,7 @@ Restart Pi or run `/reload`, then use `/login` → **Qoder Bridge** → **Person
 
 ```text
 /qoder-bridge-setup   # CLI install guidance; No is the first/default option
-/qoder-bridge-status  # CLI version and local login availability
+/qoder-bridge-status  # installed SDK version, qodercli availability and CLI login status
 ```
 
 The setup command runs an official installer **only after you explicitly select Yes**. Windows x64 uses the PowerShell installer; macOS/Linux x64/arm64 use `curl -fsSL https://qoder.com/install | bash` in a separate terminal. Windows arm64 and other unsupported combinations do not offer installation. Review downloaded scripts before consenting. No installs are run by the package at startup.
@@ -42,7 +42,10 @@ To load this checkout across Pi sessions, run `pi install <absolute-path-to-this
 - Conversation history and tool schemas are sent to Qoder's service. Input is **text-only**; images are represented as placeholders, not transmitted. The catalog is a static snapshot, not a live per-account availability check.
 - Token costs/prices in model metadata are zero placeholders; actual Qoder billing/credits are governed by your Qoder account. Browser sign-in launched by the CLI is best-effort and can require an interactive terminal.
 - Malformed tool envelopes and unknown tools fail with terminal protocol errors (no automatic repair or retry). SDK terminal results complete the Pi turn without waiting for transport EOF. Post-tool silence is classified as `POST_TOOL_CONTINUATION_TIMEOUT`.
-- Debugging: set `QODER_BRIDGE_DEBUG=1` to emit redacted requests, responses, normalized output, tool calls/results, transitions and timeout classifications to stderr; redirect stderr to save diagnostics. Payload logging is off by default. Debug output may still contain repository content; keep it private. `providerMessageTimeoutMs` (120s), `postToolContinuationTimeoutMs` (15s), `providerQueueTimeoutMs` (120s) and `totalDeadlineMs` (300s) can be set per stream call. While the SDK reports a model queue, the dedicated queue silence bound replaces the normal response/continuation bound so the SDK's 30s polling interval is not cut short. A ready notification or model output restores normal silence monitoring. Queue messages never extend the absolute deadline. Each call is stateless; the full validated Pi transcript is replayed, not a Qoder session resume.
+- SDK failure classification: errors thrown by the SDK surface with stable prefixes — `SDK_PROTOCOL_VERSION_MISMATCH` (wire-protocol major mismatch between qodercli and this SDK build), `SDK_UNSUPPORTED_CLI_CAPABILITY` (a required capability is not advertised), `SDK_CONTROL_REQUEST_TIMEOUT` / `SDK_CONTROL_REQUEST_REJECTED` (outbound control request timed out or was rejected; the SDK's own `retryable` flag is forwarded verbatim but the bridge never retries), `SDK_MODEL_POLICY_TIMEOUT`, `SDK_HOOK_STOPPED` (a hook ended the agent turn; pending tool calls are never released), and `SDK_TERMINAL_ERROR` (non-success result subtype or `is_error`). The supplied PAT, `Bearer` values and token-like assignments are redacted from surfaced messages; SDK `error.details` is never surfaced. These codes are diagnostics, not retry-safety claims.
+- Terminal result metadata: `error_code` and `terminal_reason` (agent-termination signal independent of the model `stop_reason`) are recorded in `sdk_terminal_metadata` even for failing results, and in `sdk_terminal_result` / `handoff` for successful results. Finite numbers and short identifier-like strings are retained; arbitrary free-form values are omitted and secrets are redacted. The bridge does not infer success or failure from `error_code`; `subtype` and `is_error` remain authoritative. `terminal_reason=hook_stopped` means a hook ended the turn; with pending tool calls it fails closed, with text it completes normally and is never a stop-reason contradiction. Unknown or absent reasons remain compatible and are recorded, not invented into errors.
+- SDK warnings: an optional `onWarning(warning)` stream extra receives bounded, sanitized warnings (currently `agents_md_size_warning`: kind, code, severity, byte totals, load status and file count — never file contents or model text). It is independent of `QODER_BRIDGE_DEBUG` and payload logging; callback failures are swallowed. `commands_changed`/model-catalog events are ignored safely — they never become tools or commands. Live catalog, BYOK configuration, daemon, additional auth modes, SDK tool execution, images and persistent goals are not implemented.
+- Debugging: set `QODER_BRIDGE_DEBUG=1` to emit redacted requests, responses, normalized output, tool calls/results, transitions and timeout classifications to stderr; redirect stderr to save diagnostics. Payload logging is off by default. Debug output may still contain repository content; keep it private. `providerMessageTimeoutMs` (120s), `postToolContinuationTimeoutMs` (15s), `providerQueueTimeoutMs` (120s) and `totalDeadlineMs` (900s / 15min) can be set per stream call. While the SDK reports a model queue, the dedicated queue silence bound replaces the normal response/continuation bound so the SDK's 30s polling interval is not cut short. A ready notification or model output restores normal silence monitoring. Queue messages never extend the absolute deadline. The 15min default is a finite allowance for congested model queues such as Qwen's — it is not the SDK's maximum queue time and not a service guarantee. The turn can always be cancelled via `signal`, still ends in an error once the deadline elapses, and the bridge never retries or waits indefinitely. Each call is stateless; the full validated Pi transcript is replayed, not a Qoder session resume.
 - Live verification (separate from fixtures): `node --import tsx scripts/verify-provider.mjs`. It uses existing Qoder authentication without changing Pi settings and performs real repository-only reads/listings across three runs. `QODER_BRIDGE_TEST_MODEL` optionally overrides the default `Qwen3.8-Flash`; live checks allow 120s per continuation. Results are saved under `test-artifacts/`.
 
 ## Tool envelope dispatch

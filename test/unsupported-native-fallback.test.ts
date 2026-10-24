@@ -121,8 +121,13 @@ test("T13 unknown/new SDK versions start UNVERIFIED without semver promotion", (
 test.skip("T14 SDK executor=0 AND real Pi executor=1: UNPROVEN; active safe fallback is BLOCKED", () => {});
 
 test("installed version awareness reads actual SDK package", () => {
-  assert.equal(installedQoderSdkVersion(), "1.0.32");
-  assert.equal(qoderCapabilityRegistry().sdkVersion, installedQoderSdkVersion());
+  // Pinned SDK version — the registry deliberately does NOT auto-promote it:
+  // only 1.0.32 has an audited parse/identity baseline, so 1.0.51 reports
+  // every capability as UNVERIFIED.
+  assert.equal(installedQoderSdkVersion(), "1.0.51");
+  const registry = qoderCapabilityRegistry();
+  assert.equal(registry.sdkVersion, installedQoderSdkVersion());
+  assert.ok(Object.values(registry.capabilities).every(status => status === "UNVERIFIED"));
 });
 
 test("opt-in fails before query creation; zero tool emissions, no continuation retry", async () => {

@@ -94,10 +94,108 @@ test("queue heartbeats cannot extend the absolute deadline", async () => {
     for await (const _ of stream) { /* drain */ }
     const out = await stream.result();
     assert.equal(out.stopReason, "error");
-    assert.match(out.errorMessage ?? "", /^PROVIDER_UNAVAILABLE:/);
+    assert.match(out.errorMessage ?? "", /^PROVIDER_UNAVAILABLE: total deadline 100ms reached \(elapsed \d+ms\)$/);
     assert.ok(closed, "queue query must be closed on timeout");
     assert.ok(Date.now() - started < 1000, "heartbeats must not keep the turn running");
   } finally { closed = true; __setBridgeInternals({}); }
+});
+
+test("absolute deadline is not reported as a short provider-silence window", async () => {
+  const out = await run([user], (async function* () { await new Promise<void>(() => {}); yield result; })(), {
+    providerMessageTimeoutMs: 500,
+    totalDeadlineMs: 40,
+  });
+  assert.match(out.errorMessage ?? "", /^PROVIDER_RESPONSE_TIMEOUT: total deadline 40ms reached \(elapsed \d+ms\)$/);
+});
+
+// Regression: the production default deadline (900s) tolerates congested
+// queues that outlast the ordinary silence bounds, but queue heartbeats still
+// never extend it. A fake Date.now + stubbed (never-firing) timers keep this
+// deterministic — no real 5/15-minute waits — while streamQoder genuinely runs
+// with no explicit totalDeadlineMs, so it exercises DEFAULT_TOTAL_DEADLINE_MS.
+// Every heartbeat yield resolves on microtask turns, so heartbeats always win
+// their race against the armed bound (the real pattern where SDK status polls
+// arrive inside the queue silence bound); elapsed wall-clock advances only via
+// clock.advance() between yields.
+const installFakeClock = () => {
+  const realNow = Date.now;
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  let now = 0;
+  let seq = 0;
+  Date.now = () => now;
+  (globalThis as { setTimeout: unknown }).setTimeout = () => ++seq;
+  (globalThis as { clearTimeout: unknown }).clearTimeout = () => {};
+  const restore = () => {
+    Date.now = realNow;
+    (globalThis as { setTimeout: unknown }).setTimeout = realSetTimeout;
+    (globalThis as { clearTimeout: unknown }).clearTimeout = realClearTimeout;
+  };
+  return { advance: (ms: number) => { now += ms; }, restore, now: () => now };
+};
+
+// Streams queue heartbeats until `until` (checked against the fake clock)
+// passes, then completes normally.
+async function* queuedHeartbeats(until: () => boolean): AsyncGenerator<SDKMessage> {
+  let index = 0;
+  while (!until()) {
+    yield queue("queued", `hb-${index++}`);
+  }
+  yield queue("ready", "ready");
+  yield text;
+  yield result;
+}
+
+// Runs streamQoder without any explicit totalDeadlineMs (the production
+// default is under test), advancing the fake clock by strideMs whenever the
+// stream still has not settled after a batch of microtask hops.
+async function runWithFakeClock(messages: Message[], source: AsyncGenerator<SDKMessage>, clock: ReturnType<typeof installFakeClock>, strideMs: number) {
+  let closed = false;
+  __setBridgeInternals({ queryFactory: () => ({
+    [Symbol.asyncIterator]: () => source,
+    close: async () => { closed = true; },
+  }) });
+  try {
+    const stream = streamQoder(MODEL, normalizeContext({ systemPrompt: "fixture", tools: [], messages }), {
+      providerMessageTimeoutMs: 30, postToolContinuationTimeoutMs: 30, providerQueueTimeoutMs: 100,
+    });
+    const drain = (async () => {
+      for await (const _ of stream) { /* drain */ }
+      return stream.result();
+    })();
+    let settled = false;
+    drain.then(() => { settled = true; }, () => { settled = true; });
+    for (let guard = 0; guard < 2_000 && !settled; guard++) {
+      for (let i = 0; i < 30; i++) await Promise.resolve();
+      if (!settled) clock.advance(strideMs);
+    }
+    assert.ok(settled, "stream settled within the fake-clock drive loop");
+    return { out: await drain, closed };
+  } finally { __setBridgeInternals({}); }
+}
+
+for (const [label, messages] of [["initial response", [user]], ["post-tool continuation", continuation]] as const) {
+  test(`default 900s deadline outlasts 5min of queue heartbeats for ${label}`, async () => {
+    const clock = installFakeClock();
+    try {
+      const source = queuedHeartbeats(() => clock.now() >= 310_000);
+      const { out } = await runWithFakeClock([...messages], source, clock, 20_000);
+      assert.equal(out.stopReason, "stop", out.errorMessage ?? "a 310s congested queue must still complete under the 900s default");
+      assert.equal((out.content[0] as { text: string }).text, "OK");
+      assert.ok(clock.now() >= 300_000, "simulated elapsed time must exceed the old 300s default");
+    } finally { clock.restore(); }
+  });
+}
+
+test("default 900s deadline still fails finitely while heartbeats keep arriving", async () => {
+  const clock = installFakeClock();
+  try {
+    const { out, closed } = await runWithFakeClock(continuation, queuedHeartbeats(() => false), clock, 20_000);
+    assert.equal(out.stopReason, "error");
+    assert.match(out.errorMessage ?? "", /total deadline 900000ms reached \(elapsed \d+ms\)$/);
+    assert.ok(closed, "queue query must be closed when the absolute deadline fires");
+    assert.ok(clock.now() >= 900_000, "the default deadline elapsed before the error was raised");
+  } finally { clock.restore(); }
 });
 
 test("abort still interrupts queued waiting immediately", async () => {

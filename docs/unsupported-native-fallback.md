@@ -19,6 +19,17 @@ SDK 1.0.32で確認済みのnative tool_use parse／single identity／parallel i
 
 未監査versionはすべてUNVERIFIED。semverでの自動昇格はしない。installed packageのversionを参照し、取得できなければUNKNOWNとして未確認扱いにする。
 
+## sdk_1_0_51_recheck
+
+2026-10-11にSDK `1.0.51` の公開型と公式permission/user-input契約を再確認した。新versionは引き続き全capabilityを **UNVERIFIED** とし、既存監査表の `SUPPORTED` を引き継がない。
+
+- [Approval and User Input](https://docs.qoder.com/cli/sdk/user-input) は、事前許可済みツールは `canUseTool` を呼ばずに実行され、callbackは全ツール呼び出しを受け取らないと明記している。callbackの存在だけでPiのみの実行所有は証明できない。同文書は全tool callの観測にはhooksを案内しており、hooks自体が使えないと判断したわけではない。
+- [Permission Control](https://docs.qoder.com/cli/sdk/permissions) と公開型には `PreToolUse.permissionDecision: 'defer'` が存在する。一方、公開型の `deferred_tool_use?: unknown` から、正確なcall ID/argsのhandoff・host実行結果の再注入・継続の安定した契約は確認できていない。
+- 全built-in/MCP/plugin/agent/backgroundと起動時hook等を含め、SDK executor=0を保証するrequest-only境界は今回の調査でも未確認。機能が存在しない／最新版に必ず不具合があるという断定ではなく、受入条件に足りる証拠がない。
+- 通常の厳格テキスト経路は `Qwen3.8-Flash` で実通信を行ったが、native schema/defer probeは実行していない。text往復の成功をnative実行所有の証拠にはしない。実通信結果と残る停止問題は `docs/sdk-update.md` の `live_revalidation` に記録した。
+
+従って **READY_FOR_USE=NO** を維持する。提供元のrequest-only/handoff契約確認と、SDK executor=0 / real Pi executor=1 / Pi approval→continuationの独立した実証が再開条件。
+
 ## feature flag
 
 `QODER_UNVERIFIED_NATIVE_FALLBACK=1` は現在**SDK queryを開始する前に拒否する安全gate**。native fallbackを動かす設定ではない。SDK起動前にはnative eventがあるか判断できず、起動後ではSDK側実行を防いだ証明にならないため、このflagではtext-only requestも含む全Qoder queryを止める。

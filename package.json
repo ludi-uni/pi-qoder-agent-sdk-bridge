@@ -34,7 +34,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@qoder-ai/qoder-agent-sdk": "1.0.51"
+    "@qoder-ai/qoder-agent-sdk": "1.0.59"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

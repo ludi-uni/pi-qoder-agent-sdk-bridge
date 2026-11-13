@@ -110,7 +110,7 @@ test("T12 audited parse/identity support is not treated as unsupported execution
 });
 
 test("T13 unknown/new SDK versions start UNVERIFIED without semver promotion", () => {
-  for (const version of ["UNKNOWN", "1.0.33", "1.1.0", "2.0.0", "1.0.32-beta", ""]) {
+  for (const version of ["UNKNOWN", "1.0.33", "1.0.56", "1.0.59", "1.1.0", "2.0.0", "1.0.32-beta", ""]) {
     const registry = qoderCapabilityRegistry(version);
     assert.equal(registry.sdkVersion, version);
     assert.ok(Object.values(registry.capabilities).every(v => v === "UNVERIFIED"));
@@ -122,9 +122,9 @@ test.skip("T14 SDK executor=0 AND real Pi executor=1: UNPROVEN; active safe fall
 
 test("installed version awareness reads actual SDK package", () => {
   // Pinned SDK version — the registry deliberately does NOT auto-promote it:
-  // only 1.0.32 has an audited parse/identity baseline, so 1.0.51 reports
+  // only 1.0.32 has an audited parse/identity baseline, so 1.0.59 reports
   // every capability as UNVERIFIED.
-  assert.equal(installedQoderSdkVersion(), "1.0.51");
+  assert.equal(installedQoderSdkVersion(), "1.0.59");
   const registry = qoderCapabilityRegistry();
   assert.equal(registry.sdkVersion, installedQoderSdkVersion());
   assert.ok(Object.values(registry.capabilities).every(status => status === "UNVERIFIED"));

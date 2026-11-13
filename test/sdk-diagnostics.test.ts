@@ -16,8 +16,10 @@ import {
 import {
   ControlRequestError,
   CONTROL_REQUEST_TIMEOUT_CODE,
+  FrameTooLargeError,
   ModelPolicyTimeoutError,
   ProtocolVersionMismatchError,
+  QoderCliInitializationError,
   UnsupportedCliCapabilityError,
   type SDKMessage,
   type SDKResultMessage,
@@ -76,6 +78,52 @@ async function run(messages: SDKMessage[], options: Record<string, unknown> = {}
   finally { __setBridgeInternals({}); }
 }
 
+test("shared-daemon queries use a supported permission mode and deny SDK approval requests", async () => {
+  let calls = 0;
+  __setBridgeInternals({ queryFactory: params => {
+    calls++;
+    assert.equal(params.options?.permissionMode, "default");
+    assert.deepEqual(params.options?.tools, []);
+    assert.ok(params.options?.disallowedTools?.includes("Bash"));
+    assert.equal(params.options?.persistSession, false);
+    const deny = params.options?.canUseTool;
+    assert.ok(deny);
+    return {
+      [Symbol.asyncIterator]: () => (async function* () {
+        for (const name of ["Bash", "Read", "mcp__unknown__tool"]) {
+          const decision = await deny(name, {}, { signal: new AbortController().signal, toolUseID: `denied-${name}` });
+          assert.equal(decision.behavior, "deny");
+        }
+        yield assistantText("ok");
+        yield resultMessage();
+      })(),
+      close: async () => {},
+    };
+  } });
+  try {
+    const { events, final } = await collect(streamQoder(MODEL, CTX, FAST as never));
+    assert.equal(final.stopReason, "stop");
+    assert.ok(!events.some(event => event.type === "toolcall_end"));
+    assert.equal(calls, 1);
+  } finally { __setBridgeInternals({}); }
+});
+
+test("daemon configuration conflicts fail without retry, tool emission or credential disclosure", async () => {
+  const secret = "DAEMON_PAT_SECRET_9";
+  let calls = 0;
+  const error = new Error(`daemon configuration conflict api_key=${secret}`);
+  error.name = "DaemonConfigurationConflictError";
+  __setBridgeInternals({ queryFactory: () => { calls++; throw error; } });
+  try {
+    const { events, final } = await collect(streamQoder(MODEL, CTX, { ...FAST, apiKey: secret } as never));
+    assert.equal(final.stopReason, "error");
+    assert.match(final.errorMessage ?? "", /^SDK_DAEMON_CONFIGURATION_CONFLICT:/);
+    assert.ok(!final.errorMessage?.includes(secret));
+    assert.ok(!events.some(event => event.type === "toolcall_end"));
+    assert.equal(calls, 1);
+  } finally { __setBridgeInternals({}); }
+});
+
 // --- structured SDK failure classification (query() / iterator throws) ---
 
 test("ProtocolVersionMismatchError classifies with a stable code, no retry claim", async () => {
@@ -124,6 +172,47 @@ test("errors thrown inside the async iterator classify the same way", async () =
   try {
     const { final } = await collect(streamQoder(MODEL, CTX, FAST as never));
     assert.equal(final.errorMessage?.split(":")[0], SDK_ERROR_CODE.UNSUPPORTED_CLI_CAPABILITY);
+  } finally { __setBridgeInternals({}); }
+});
+
+// SDK 1.0.56 exports FrameTooLargeError / QoderCliInitializationError. The
+// bridge deliberately keeps the explicit unknown-error fallback for them
+// (no new classification codes in this change): the stream still terminates
+// with stopReason=error, credentials stay redacted, and no retry or tool
+// emission happens. error.result / error.details are never surfaced.
+test("FrameTooLargeError terminates through the generic error path, redacted and without retry", async () => {
+  const secret = "FRAME_PAT_SECRET_5";
+  let calls = 0;
+  const error = new FrameTooLargeError("input", 64 * 1024 * 1024, 70 * 1024 * 1024, `SDK input api_key=${secret}`, "uuid-9");
+  __setBridgeInternals({ queryFactory: () => { calls++; throw error; } });
+  try {
+    const { events, final } = await collect(streamQoder(MODEL, CTX, { ...FAST, apiKey: secret } as never));
+    assert.equal(calls, 1, "the bridge never retries the SDK call");
+    assert.equal(final.stopReason, "error");
+    assert.match(final.errorMessage ?? "", /exceeded the .*-byte frame limit/);
+    assert.ok(!(final.errorMessage ?? "").includes(secret));
+    assert.equal(events.some(e => e.type.startsWith("toolcall_")), false);
+    assert.equal(events.some(e => e.type === "done"), false);
+  } finally { __setBridgeInternals({}); }
+});
+
+test("QoderCliInitializationError surfaces a bounded message, never the full result payload", async () => {
+  const secret = "INIT_PAT_SECRET_6";
+  const result = resultMessage({ subtype: "error_during_execution", is_error: true, errors: [`init denied api_key=${secret}`], error_code: "E_INIT" });
+  const error = new QoderCliInitializationError(result);
+  let calls = 0;
+  __setBridgeInternals({ queryFactory: () => { calls++; throw error; } });
+  try {
+    const { events, final } = await collect(streamQoder(MODEL, CTX, { ...FAST, apiKey: secret } as never));
+    assert.equal(calls, 1, "no retry");
+    assert.equal(final.stopReason, "error");
+    assert.match(final.errorMessage ?? "", /init denied/);
+    assert.ok(!(final.errorMessage ?? "").includes(secret));
+    // error.result (full SDKResultMessage) is never dumped into errorMessage.
+    assert.ok(!(final.errorMessage ?? "").includes(result.session_id));
+    assert.ok(!(final.errorMessage ?? "").includes("permission_denials"));
+    assert.equal(events.some(e => e.type.startsWith("toolcall_")), false);
+    assert.equal(events.some(e => e.type === "done"), false);
   } finally { __setBridgeInternals({}); }
 });
 

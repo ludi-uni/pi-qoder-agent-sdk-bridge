@@ -229,8 +229,8 @@ const QODER_MODELS: QoderModelEntry[] = [
   { id: "Kimi-K2.8-Preview", reasoning: true, contextWindow: 1_000_000, maxTokens: 65_536, efforts: { low: "low", high: "high", max: "max" } },
   { id: "GLM-5.3", reasoning: true, contextWindow: 1_000_000, maxTokens: 65_536, efforts: { low: "low", high: "high", max: "max" } },
   { id: "GLM-5.3-Flash", reasoning: true, contextWindow: 1_000_000, maxTokens: 65_536, efforts: { high: "high", max: "max" } },
-  { id: "DeepSeek-V4-Pro", reasoning: true, contextWindow: 1_000_000, maxTokens: 65_536, efforts: { high: "high", max: "max" } },
-  { id: "DeepSeek-Flash", reasoning: true, contextWindow: 1_000_000, maxTokens: 65_536, efforts: { low: "low", high: "high", max: "max" } },
+  { id: "DeepSeek-V4-Pro", reasoning: true, contextWindow: 1_000_000, maxTokens: 32_000, efforts: { high: "high", max: "max" } },
+  { id: "DeepSeek-Flash", reasoning: true, contextWindow: 1_000_000, maxTokens: 32_000, efforts: { low: "low", high: "high", max: "max" } },
   { id: "MiniMax-M3", reasoning: false, contextWindow: 1_000_000, maxTokens: 65_536 },
   { id: "Auto", reasoning: true, contextWindow: 1_000_000, maxTokens: 65_536 },
   { id: "Ultimate", reasoning: true, contextWindow: 1_000_000, maxTokens: 65_536, efforts: { low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" } },
@@ -1017,7 +1017,7 @@ export const PROVIDER_TIMEOUT_KIND = {
 } as const;
 
 /**
- * Stable error codes for known SDK 1.0.51 failure classes. They are
+ * Stable error codes for known SDK failure classes. They are
  * classification labels only: retry safety is NOT claimed — SDK ControlRequestError
  * carries its own `retryable` flag which the bridge forwards when the runtime
  * supplies it — and no automatic retry is ever performed.
@@ -1033,6 +1033,8 @@ export const SDK_ERROR_CODE = {
   CONTROL_REQUEST_REJECTED: "SDK_CONTROL_REQUEST_REJECTED",
   /** The resolveModel callback did not return within resolveModelTimeoutMs. */
   MODEL_POLICY_TIMEOUT: "SDK_MODEL_POLICY_TIMEOUT",
+  /** The shared daemon cannot reuse different authentication or launch settings. */
+  DAEMON_CONFIGURATION_CONFLICT: "SDK_DAEMON_CONFIGURATION_CONFLICT",
   /** Terminal result reports agent termination via a hook (terminal_reason=hook_stopped). */
   HOOK_STOPPED: "SDK_HOOK_STOPPED",
   /** Terminal result carried a non-success subtype or is_error. */
@@ -1097,6 +1099,8 @@ function classifySdkError(error: Error): { code: string; retryable?: boolean } {
   if (error instanceof ProtocolVersionMismatchError) return { code: SDK_ERROR_CODE.PROTOCOL_VERSION_MISMATCH };
   if (error instanceof UnsupportedCliCapabilityError) return { code: SDK_ERROR_CODE.UNSUPPORTED_CLI_CAPABILITY };
   if (error instanceof ModelPolicyTimeoutError) return { code: SDK_ERROR_CODE.MODEL_POLICY_TIMEOUT };
+  // SDK 1.0.59 does not export this class from its public entrypoint.
+  if (error.name === "DaemonConfigurationConflictError") return { code: SDK_ERROR_CODE.DAEMON_CONFIGURATION_CONFLICT };
   return { code: "SDK_ERROR" };
 }
 
@@ -1306,7 +1310,7 @@ export function streamQoder(
       const systemPrompt = bridgeSystemPrompt(context);
       debug(continuation ? "continuation_request" : "provider_request", {
         prompt: { PI_CONVERSATION_JSON: history },
-        options: { cwd: process.cwd(), model: model.id, systemPrompt, tools: [], permissionMode: "dontAsk", maxTurns: 1, persistSession: false, maxTokens: options?.maxTokens ?? model.maxTokens, reasoning: options?.reasoning },
+        options: { cwd: process.cwd(), model: model.id, systemPrompt, tools: [], permissionMode: "default", maxTurns: 1, persistSession: false, maxTokens: options?.maxTokens ?? model.maxTokens, reasoning: options?.reasoning },
       });
       for (const message of history) if (message.role === "tool_result") debug("tool_result", message);
       q = makeQuery({
@@ -1318,7 +1322,11 @@ export function streamQoder(
           systemPrompt,
           tools: [],
           disallowedTools: ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebFetch", "WebSearch", "Agent", "Skill"],
-          permissionMode: "dontAsk",
+          // Shared-daemon queries reject dontAsk in SDK 1.0.59. Do not
+          // replace it with bypassPermissions: deny SDK permission requests.
+          // This callback is defense in depth, not ambient execution proof.
+          permissionMode: "default",
+          canUseTool: async () => ({ behavior: "deny", message: "Pi owns tool execution and approval." }),
           // Debug mode additionally observes raw stream_event deltas. They are
           // diagnostics ONLY — the single authoritative assembly path is the
           // final SDK assistant message snapshots; deltas and result.result

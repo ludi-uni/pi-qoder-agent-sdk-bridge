@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import qoderBridgeExtension, { bridgeSystemPrompt, cliInstallCommand, cliSetupInstructions, completeCliLogin, loginMethods, offerCliInstall, parseToolCalls, qoderCliCommand, serializeContext } from "../extensions/index.js";
-import { normalizeContext, type Context, type Provider, type ProviderAuthInteraction } from "@earendil-works/pi-ai";
+import { normalizeContext, type Api, type Context, type Model, type Provider, type ProviderAuthInteraction } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 test("serializeContext maps user / assistant / tool_result messages", () => {
@@ -152,6 +152,31 @@ test("PAT login opens the official creation page and stores the entered token", 
   }]);
   assert.equal((prompts[1] as { type: string }).type, "secret");
   assert.deepEqual(credential, { type: "api_key", key: "test-token" });
+});
+
+// Offline registration snapshot: SDK 1.0.56 getAvailableModels reports
+// maxOutputTokens=32000 for DeepSeek-V4-Pro (dmodel) and DeepSeek-Flash
+// (dfmodel); the static catalog must reflect that bound. Costs stay at the
+// intentional zero placeholders — no dynamic catalog or rate change here.
+test("provider registration exposes DeepSeek models at the SDK 1.0.56 32k output bound", () => {
+  let provider: Provider | undefined;
+  qoderBridgeExtension({ registerProvider: (entry: Provider) => { provider = entry; }, registerCommand: () => {} } as unknown as ExtensionAPI);
+  assert.ok(provider);
+  const byId = new Map(provider.getModels().map((entry) => [entry.id, entry]));
+  const pro = byId.get("DeepSeek-V4-Pro") as Model<Api> | undefined;
+  const flash = byId.get("DeepSeek-Flash") as Model<Api> | undefined;
+  assert.ok(pro);
+  assert.ok(flash);
+  for (const entry of [pro, flash]) {
+    assert.equal(entry.reasoning, true);
+    assert.equal(entry.contextWindow, 1_000_000);
+    assert.equal(entry.maxTokens, 32_000);
+    assert.equal(entry.provider, "qoder-bridge");
+  }
+  assert.deepEqual(pro.thinkingLevelMap, { high: "high", max: "max" });
+  assert.deepEqual(flash.thinkingLevelMap, { low: "low", high: "high", max: "max" });
+  // Unrelated catalog entries are untouched by the DeepSeek bound update.
+  assert.ok(byId.has("Qwen3.8-Max"));
 });
 
 test("parseToolCalls extracts a single envelope", () => {

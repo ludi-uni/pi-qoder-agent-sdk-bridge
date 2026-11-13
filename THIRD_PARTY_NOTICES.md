@@ -4,7 +4,7 @@ This repository's own extension and documentation are MIT-licensed (see [LICENSE
 
 | Package | Role | Published license / terms checked |
 | --- | --- | --- |
-| `@qoder-ai/qoder-agent-sdk@1.0.32` | runtime dependency | `SEE LICENSE IN LICENSE`; installed `LICENSE` refers to [Qoder Product Service Terms](https://qoder.com/product-service), **not MIT**. Its postinstall downloads a proprietary Worker runtime. |
+| `@qoder-ai/qoder-agent-sdk@1.0.59` | runtime dependency | `SEE LICENSE IN LICENSE`; installed `LICENSE` refers to [Qoder Product Service Terms](https://qoder.com/product-service), **not MIT**. Its postinstall downloads a proprietary Worker runtime. |
 | `@modelcontextprotocol/sdk` | transitive SDK dependency | MIT (npm metadata). |
 | `zod` | SDK peer dependency | MIT (npm metadata). |
 | `@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent` | host-supplied peers | MIT (npm metadata). |

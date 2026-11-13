@@ -30,6 +30,14 @@ SDK 1.0.32で確認済みのnative tool_use parse／single identity／parallel i
 
 従って **READY_FOR_USE=NO** を維持する。提供元のrequest-only/handoff契約確認と、SDK executor=0 / real Pi executor=1 / Pi approval→continuationの独立した実証が再開条件。
 
+## sdk_1_0_56_update
+
+2026-10-24に依存SDKを1.0.56、Workerを1.1.78へ更新した。公開型のdefer/permission契約に実行所有を証明する変更は確認できず、1.0.56の全capabilityもUNVERIFIEDとする。DeepSeek-Flashのstrict text経路でbasic往復が成功したことは、native request-only/approval境界の実証ではない。起動前gateと3件のskipを維持する。更新・回帰・実通信の詳細は `docs/sdk-update.md` の `sdk_1_0_56_update_2026_10_24` を参照。
+
+## sdk_1_0_59_update
+
+依存SDKを1.0.59、Workerを1.1.83へ更新した。既定queryの共有daemon化はnative request-only境界の実証ではない。1.0.59も全capabilityをUNVERIFIEDとし、起動前gateと3件のskipを維持する。実推論・native handoffの実通信試験は今回行っていない。後続の推論なし実通信では、`tools: []`でもinitに`mcp_call` / `mcp_get` / `mcp_list`の登録が残ることを確認した。実行は観測しておらず、未実行のprobeからcallbackによる拒否やambient closureの成立を推定しない。新公開host-toolメッセージも通知用の型であり実行所有の移譲契約ではない。詳細は `docs/sdk-update.md` の `sdk_1_0_59_update` / `live_recheck_1_0_59` を参照。
+
 ## feature flag
 
 `QODER_UNVERIFIED_NATIVE_FALLBACK=1` は現在**SDK queryを開始する前に拒否する安全gate**。native fallbackを動かす設定ではない。SDK起動前にはnative eventがあるか判断できず、起動後ではSDK側実行を防いだ証明にならないため、このflagではtext-only requestも含む全Qoder queryを止める。
@@ -38,7 +46,7 @@ SDK 1.0.32で確認済みのnative tool_use parse／single identity／parallel i
 - `1`：`SDK_AMBIENT_EXECUTION_CLOSURE_UNVERIFIED` の通常provider errorを返す。SDK query、toolCall emission、approval要求、executor起動、continuation retryは行わない。
 - per-call `options.env` は既存env設定と同様にprocess環境より優先。
 
-既定経路を今回新たに安全認定していない。`tools: []`／`dontAsk`／`maxTurns: 1`、有限のdisallowedTools一覧はambient execution closureの保証ではない。
+既定経路を今回新たに安全認定していない。1.0.59ではdaemonが`dontAsk`を拒否するため`permissionMode: "default"`と拒否専用`canUseTool`を使用する。`tools: []`／callback／`maxTurns: 1`、有限のdisallowedTools一覧はambient execution closureの保証ではない。事前許可済みの実行がcallbackを通らない制限も残る。
 
 ## normalization boundary
 

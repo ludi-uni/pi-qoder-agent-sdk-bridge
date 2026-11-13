@@ -1,4 +1,4 @@
-# Qoder Agent SDK 1.0.51 対応計画と結果
+# Qoder Agent SDK 更新記録（1.0.51 / 1.0.56 / 1.0.59）
 
 ## 背景
 
@@ -239,3 +239,122 @@ node --import tsx scripts/verify-normalization.ts --live --case basic --rounds 1
 - 統合集計と検証script: `test-artifacts/qwen38flash-recheck-summary-20261024/offline-verdict-audit.json` / `audit.mjs`
 
 試験時間合計1875462ms（約31分15秒）。3ケースが完全成功していないため、40件campaignには進んでいない。
+
+## sdk_1_0_56_update_2026_10_24
+
+ユーザー承認により依存を `@qoder-ai/qoder-agent-sdk` **1.0.51→1.0.56**へ更新した。`npm install @qoder-ai/qoder-agent-sdk@1.0.56 --save-exact --ignore-scripts --no-audit --no-fund` の後、対象SDKだけを `npm rebuild @qoder-ai/qoder-agent-sdk --foreground-scripts --no-audit --no-fund` で再構築。postinstallによるWorker取得・SHA256検証が成功し、`runtime-info.json` と実通信initで **Worker1.1.78 / protocol1.5.0** を確認した。ブリッジversionは0.5.0のまま、Node要件・Pi設定・認証情報は変更していない。
+
+### changes_and_limits
+
+- [公式SDKリリースノート](https://docs.qoder.com/release-notes/agent-sdk)では1.0.54のセッション終了処理改善、1.0.55の期限切れcredentialによる失敗修正を確認。調査時点で1.0.56の独立した記載はなく、queue/busy10605の解消も明記されていない。
+- query/auth/queue/resultの公開契約は型互換。追加の `FrameTooLargeError` / `QoderCliInitializationError` は既存の汎用エラー経路で終端し、秘密情報の秘匿・tool emissionなし・追加retryなしを実クラスのfixtureで検証した。新しいSDKエラーコードへの個別分類は今回追加していない。
+- native capabilityは1.0.56でもすべてUNVERIFIED。version awarenessテストを更新し、semverによる昇格をしない。native fallbackは無効のまま。
+
+### live_catalog
+
+推論を送らないAsyncIterableをpromptに指定して `getAvailableModels({fetchStrategy:'live'})` を実行し、モデル一覧を取得できた。送信user message0、assistant/stream event0、tool要求0。catalog取得は成功したが、3秒の終了待機上限内に `close()` はsettleしなかった。終了したと偽らず `closeUnsettled=true` を原証拠に残した（推論成功とは別の観測）。
+
+| SDK表示名 | canonical value | 利用可能 | 現時点の無料フラグ/料金倍率 | 出力上限 |
+|---|---|---|---|---|
+| DeepSeek-V4-Pro | dmodel | true | isFree=false / 0.5 | 32000 |
+| DeepSeek-Flash | dfmodel | true | isFree=true / 0 | 32000 |
+
+この2表示名は既存の静的カタログにも存在しており、新モデル名を推測追加していない。実測メタデータに合わせ、DeepSeek2行の `maxTokens` のみ65536→32000へ修正。ID・contextWindow1000000・reasoning・effort mapは保持した。コスト欄は従来のplaceholderのまま、無料状態の将来保証や自動選択は導入しない。SDK一覧にはKimi/MiniMax等の表示変化もあったが、今回の依頼外の全モデル再編は行っていない。
+
+原一覧: ignored `test-artifacts/sdk-1056-update/catalog-result.json`。credentialや個人のアカウント情報は記録せず、system modelの許可したメタデータだけを保存した。
+
+### verification
+
+- `npm run typecheck` 通過。全テスト **255成功・失敗0・3 skip（計258）**。DeepSeek登録メタデータ、SDK実version/UNVERIFIED、新SDK例外2種の汎用終端・秘匿を検証。
+- `npm pack --dry-run --json --ignore-scripts` 通過。Worker/node_modules/原記録は配布しない。
+- 無料フラグを取得できた2モデルでbasicのみ各1回。各turnの期限900000ms、SDK built-in tools無効・Pi側allowlist read1件・自動retryなし。DeepSeek-V4-Proにはリクエストを送っていない。
+
+| model | 所要時間 | 結果 |
+|---|---|---|
+| Qwen3.8-Flash | 330598ms（約5分31秒） | SDK busy10605、SERVICE_FAILURE。tool実行0回 |
+| DeepSeek-Flash | 469140ms（約7分49秒） | FULL PASS。read(package.json)を1回実行し、結果返却後にpackage nameと固定最終行を含む最終回答 |
+
+DeepSeekのturn1は167637ms、turn2は298112msでqueue readyに到達した。共通basic planの固定marker `QWEN_LIVE_BASIC_1` を使ったが、実要求model・SDK initは両turnともDeepSeek-Flashであり、Qwenへfallbackしたものではない。両モデルともdrop/capture error0件。原記録から現行gateで再判定し、verdictとsource/harness hashが一致した。
+
+証跡（ignored）: `test-artifacts/sdk-1056-update/smoke-Qwen3.8-Flash-1792827665123.json`、`smoke-DeepSeek-Flash-1792828148915.json`、`verification-summary.json`。source SHA256 `5a9210989810102cdd4f1f793cb00b01abc273de1df6523e4209bd045ee78edd`。
+
+SDK/Workerの更新とDeepSeek-Flashのbasic往復は確認できた。一方、Qwen混雑は再発し、DeepSeekの逐次/batch/ENOENT回復や40件campaignは未検証。今回commit・push・version bump・npm公開は行っていない。
+
+## sdk_1_0_59_update
+
+npm registryの`latest`を確認し、作業開始時のSDK **1.0.56→1.0.59**へ更新した（直近commitの固定値は1.0.51）。既存の未commit変更は保持した。
+
+### upstream_changes
+
+公式の説明と配布物からの観測を分ける。
+
+| 対象 | 確認できた変更 | 根拠・制限 |
+|---|---|---|
+| 1.0.54 / 1.0.55 | セッション終了時のcleanup改善／期限切れcredentialによる継続失敗の修正 | 公式リリースノート。既存1.0.56更新に含まれる |
+| 1.0.57 | 同梱CLI 1.1.78→1.1.81 | 公式リリースノート |
+| 現在の1.0.59 | Worker/CLI **1.1.83** | `dist/runtime-manifest.json`と取得済み`dist/_worker/runtime-info.json`。1.0.58/1.0.59個別の公式説明は取得ページにないため、以下を特定patchの修正と断定しない |
+| 1.0.56→1.0.59 | 既定`query()`がプロセス内共有daemon上のsessionを利用 | `types/options.d.ts`、`daemon/global-daemon.d.ts`と配布実装。packageの既定launch modeはWorkerのまま |
+| 同上 | `query.close()`はsession終了。daemonは次のqueryにも共有される。`closeGraceMs`は互換入力として残るが無視される | `daemon/daemon-session-transport.d.ts`と実装、`types/options.d.ts`。ブリッジは`closeGraceMs`を設定していない |
+| 同上 | daemonのpermission modeは`default`/`acceptEdits`/`auto`/`bypassPermissions`。`dontAsk`は公開unionに残るが既定daemon経路では拒否される | `query/daemon-permission-mode.d.ts`と実装のvalidator。`yolo`はbypassのalias、`plan`は独立planModeを案内するエラー |
+| 同上 | 共有daemonの認証・起動設定が競合すると`DaemonConfigurationConflictError` | 配布実装。異なるPAT、PAT↔CLI認証の切替は競合。既存daemonを別認証へ自動置換しない |
+| 同上 | `Options.business`/`extraHeaders`、`generateSessionTitle()`の`sourceUserMessageId`/`customContext`を追加 | `types/options.d.ts`。extraHeadersは最初のqueryable inputの最初のmain-model requestとそのnetwork retryのみ。後続request/subagentへ継承されない。ブリッジでは未使用 |
+| 同上 | `initDaemon()`の戻り値が`Promise<DaemonInitResult>`→`Promise<Daemon>`へ変更、`DaemonInitResult`/`DaemonFallbackReason`を削除 | `daemon/global-daemon.d.ts`。daemon初期化失敗時に旧直接CLIへfallbackせず失敗する。ブリッジはこれらのAPIを直接使用していない |
+| 同上 | `StartDaemonOptions`にbusiness/launchMode/Worker path/heartbeat設定を追加、Process/Worker transportは共有daemonへの互換shimへ変更 | daemon heartbeat watchdogは既定120秒、capability交渉時のみ。既存のブリッジ側queue/absolute deadlineとは別の仕組み。ブリッジから設定は追加していない |
+| 同上 | host-tool use/result、CodeMode host result、hook diagnosticsの型を公開。compact-boundaryにusage/modelRequestIds/agent_id、resultに`error_message`を追加 | `types/messages.d.ts`。新しいhost-tool経路のPi統合やnative実行許可は追加していない。resultの成功判定は従来通りsubtype/is_errorに従う |
+
+公式資料: <https://docs.qoder.com/release-notes/agent-sdk>。配布version: <https://registry.npmjs.org/@qoder-ai/qoder-agent-sdk/1.0.59>。
+
+混雑10605の解消、実通信の高速化、native request-only/handoffの成立は確認していない。Workerのversionだけでこれらの改善を主張しない。
+
+### bridge_adaptations
+
+- `package.json`/lockfileを1.0.59にexact pin。`npm install @qoder-ai/qoder-agent-sdk@1.0.59 --save-exact --ignore-scripts --no-audit --no-fund`の後、対象SDKだけ`npm rebuild @qoder-ai/qoder-agent-sdk --foreground-scripts --no-audit --no-fund`。Worker1.1.83の取得とSHA256照合が成功した。
+- 非対応の`dontAsk`を`default`＋拒否専用`canUseTool`へ変更。**`bypassPermissions`は使わない**。`tools: []`、既存disallowedTools、`maxTurns: 1`、`persistSession: false`を保持。callbackは事前許可済み実行等の全経路を捕捉する保証ではなく、native安全性の昇格根拠にはしない。
+- 非公開entrypointをimportせず、公開entrypointからexportされない競合classは`error.name`で`SDK_DAEMON_CONFIGURATION_CONFLICT`へ分類。retry・自動daemon停止・別認証での救済はしない。**PAT変更やPAT↔CLI切替後はPiプロセスを再起動する**。他queryが共有するdaemonを勝手に停止しない。
+- READMEのライフサイクル説明とthird-party noticeのSDK版を更新。ライセンスは引き続きQoder Product Service Terms参照でMITではない。
+- 既存DeepSeek出力上限32000を保持。今回モデル一覧の再取得・再編はしていない。
+- native全capabilityは1.0.59でもUNVERIFIED。起動前gateと3件のskipを維持。
+
+### verification
+
+- `npm run typecheck`通過。
+- `npm test`: **257成功・失敗0・3 skip（計260）**。daemon向けpermission設定、SDK承認要求のdeny、設定競合時のretryなし/tool emissionなし/秘密値の秘匿を回帰検証。queryFactory fixtureによる検証であり、実Workerの実行所有を証明する試験ではない。
+- `npm pack --dry-run --json --ignore-scripts`でWorker/node_modules/原記録が配布対象外であることを確認。
+- 実推論・catalog照会・live handoff試験は実施していない。1.0.56のDeepSeek成功結果を1.0.59の成功証拠として流用しない。サービス混雑・終了挙動・共有daemonの実通信互換性は未検証。
+- ブリッジversionは0.5.0のまま。Node要件・Pi設定・保存credentialは変更せず、commit・push・公開も行っていない。
+
+### live_recheck_1_0_59
+
+ユーザー依頼により、更新後に推論なしの実通信を行った。
+
+- `node --import tsx test-artifacts/sdk-1059-live/runner.mjs`：live catalog取得成功（16 system models、推論イベント0・送信user message0）。initでWorker1.1.83 / protocol1.5.0を確認。catalog取得まで3435ms（close時間は含まない）、closeは3秒以内にresolve、daemon shutdownは1173msでresolve。
+- ただしQwen3.8-FlashとDeepSeek-Flashは両方とも`isEnabled=true / isFree=false / priceFactor=0.1`。無料と確認できるモデルがなく、予定したDeepSeekのbasic/sequential/batch/error-recoveryとQwen basicの**5件はすべてskip**。推論のfull passやtool flow passとして数えない。過去catalogから値は変わったが、SDK更新が料金変更の原因だとは断定しない。この段階では有料推論の承認待ちとして停止した。
+- `node --import tsx test-artifacts/sdk-1059-live/probe-tools.mjs`：同じNodeプロセスで推論なしsession A→close→session B→closeが成功。closeはそれぞれ798ms / 792ms、最後のshutdownは1190msでresolve。前回1.0.56の`closeUnsettled=true`はこの条件では再現しなかった。ただし状態・終了条件の異なる少数観測であり、不具合の恒久解消やSDK単独の因果効果は証明しない。
+- session Bのinitは193ms（Aは3142ms）。後続queryの起動成功とwarm pathの証拠だが、公開daemon identityの比較はしておらず、同一daemon再利用そのものを実証したとは言わない。
+- **新たな注意点**：`tools: []`と既存deny list指定でもinitのtoolsに`mcp_call` / `mcp_get` / `mcp_list`の3件が両sessionで表示された。これらはSDK実装中でもreserved exposedNameとして扱われる。登録の観測と実行可否は別である。全probeは推論なしでtool要求・permission callbackとも0件のため、**callbackが実際に拒否したこと、MCP proxy実行の閉鎖、SDK executor=0の一般保証は検証していない**。「全SDKツールが確実に無効」との安全認定は行わない。
+- native新公開`host_tool_use` / `host_tool_result`は公開型のコメント上host通知／output-only通知。これだけでPiへの実行所有移譲・approval・結果再注入を証明できない。native fallbackは引き続きBLOCKED、capabilityはUNVERIFIED。
+
+原証拠（すべてignored）: `test-artifacts/sdk-1059-live/catalog-result.json`、`verification-summary.json`、`probe-tools-1794531823602.json`。各runnerと製品source/gateのSHA256を原証拠に保持。今回tracked sourceの挙動変更やcredential変更は行っていない。この時点でQwenのbusy10605改善とDeepSeekの4ケースの実推論互換性は**未検証**のまま。
+
+### deepseek_live_inference_1_0_59
+
+その後ユーザーがDeepSeek Flashの使用を指定したため、**DeepSeek-Flashのみ**を対象に実推論を行った。無料という説明はcatalogで確認できないため、`isFree=false / priceFactor=0.1`という取得値と、ユーザー指定による同モデル限定の推論承認を別々に証拠へ記録した。Qwenや別モデルへのfallbackは行っていない。
+
+実行command: `node --import tsx test-artifacts/sdk-1059-deepseek-live/runner.mjs`。4ケース各1回、最大11 turnを計画し、SDK queryごとの期限900秒・campaign上限45分・自動retryなし。最後のqueryはcampaign残時間に合わせ期限を短縮した。標準production設定のまま、`maxTokens=2048 / reasoning=low`、許可するhost実行は既存planのread/grep/lsのみとした。
+
+| case | 実測所要時間 | 結果 |
+|---|---|---|
+| basic | 901426ms（約15分） | SERVICE_FAILURE / PROVIDER_QUEUE_TIMEOUT。最初のturnで終了、応答・call・実行resultなし |
+| sequential | 901036ms（約15分） | 同上。逐次呼出しの検証段階に到達していない |
+| batch | 864361ms（約14分24秒） | 同上。残時間対応の期限863401msで終了。一括呼出しの検証段階に到達していない |
+| error-recovery | 未実施 | campaign残時間不足で停止。ENOENT回復は未検証 |
+
+- 計2672075ms（約44分32秒）、3 queryを送信。全queryでrequested/initのmodelはDeepSeek-Flash、Worker1.1.83 / protocol1.5.0が一致。init後にSDKが`queued / service_available=true / queue_count=1`を継続通知したが、ready・model event・terminal resultは受信しなかった。SDK内部api retryの観測も0。busy10605ではなく、ブリッジの有限期限によるqueue timeoutで終了した。
+- この観測はSDKからのqueue status受信を証明するが、**実際のサーバー待ち行列の状態や、サービス／Worker／daemonのどこが原因かまでは特定しない**。1.0.56ではDeepSeek basic成功の証拠があるものの、今回の失敗だけでSDK更新によるregressionだと断定しない。
+- query closeは1422ms / 1032ms / 959msでresolve。最後の`shutdownDaemon()`も1111msでresolveし、プロセスは終了した。旧版で見た終了待ち未完了は、このtimeout終了条件では再現していない。
+- Pi側tool要求・実行はすべて0。permission callbackも0。実行に到達していないため、承認拒否・native ownership・MCP proxyの閉鎖を実証したとは扱わない。既知のMCP関連3件の登録は残る。native fallbackはBLOCKED/UNVERIFIEDのまま。
+- source/package/gate/runnerのhash固定と各caseの原記録を保持。親が`node --import tsx test-artifacts/sdk-1059-deepseek-live/audit.mjs`で再監査し、hash一致・3件の派生verdict一致・model応答とtool実行なしを確認した。判定を成功へ緩和したり失敗を再試行で置換したりしていない。
+
+原証拠（ignored）: `test-artifacts/sdk-1059-deepseek-live/verification-summary.json`、`case-DeepSeek-Flash-{basic,sequential,batch}-*.json`、`catalog-result.json`、親監査`parent-audit.json`。
+
+**結論：初期化・catalog取得・有限timeout・session/daemon終了は動作したが、モデル応答を受信できず、未対応だった逐次／batch／ENOENT回復が正常化したとは確認できない。** 追加の長時間推論や期限延長は行わず、失敗証拠を保存して停止した。
